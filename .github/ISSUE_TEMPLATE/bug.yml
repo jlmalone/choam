@@ -1,0 +1,43 @@
+name: Bug report
+description: Report a reproducible CHOAM failure.
+title: "Bug: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: Remove private paths, machines, addresses, and content before submitting.
+  - type: input
+    id: version
+    attributes:
+      label: CHOAM version
+    validations:
+      required: true
+  - type: dropdown
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - Transfer safety
+        - Verification
+        - Queue processing
+        - Catalog or search
+        - Network routing
+        - Installation or upgrade
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Observed behavior
+      description: Explain what happened and what you expected.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Use synthetic paths and content.
+    validations:
+      required: true

@@ -1,0 +1,93 @@
+{
+  "version": "1.0.0",
+  "machines": {
+    "desktop": {
+      "name": "desktop",
+      "hostname": "my-desktop.local",
+      "type": "DESKTOP",
+      "sshUser": "user",
+      "sshPort": 22,
+      "tailscaleIp": "100.64.0.1",
+      "networkPreference": "AUTO",
+      "repositories": {
+        "media": "/home/user/media",
+        "archive": "/home/user/archive"
+      }
+    },
+    "laptop": {
+      "name": "laptop",
+      "hostname": "my-laptop.local",
+      "type": "LAPTOP",
+      "sshUser": "user",
+      "sshPort": 22,
+      "tailscaleIp": "100.64.0.2",
+      "networkPreference": "AUTO",
+      "repositories": {
+        "media": "/home/user/media",
+        "archive": "/home/user/archive"
+      }
+    },
+    "server": {
+      "name": "server",
+      "hostname": "media-server.local",
+      "type": "SERVER",
+      "sshUser": "user",
+      "sshPort": 22,
+      "tailscaleIp": "100.64.0.3",
+      "networkPreference": "TAILSCALE",
+      "repositories": {
+        "media": "/mnt/media/movies",
+        "archive": "/mnt/media/archive"
+      },
+      "resourceLimits": {
+        "maxCpuCores": 2,
+        "maxHeapMb": 1024,
+        "ioNice": true
+      }
+    }
+  },
+  "drives": {
+    "movies-4tb": {
+      "uuid": "A1B2C3D4-E5F6-7890-ABCD-EF1234567890",
+      "label": "movies-4tb",
+      "repositories": {
+        "media": "movies",
+        "archive": "archive"
+      }
+    },
+    "backup-2tb": {
+      "uuid": "DEADBEEF-1234-5678-9ABC-DEF012345678",
+      "label": "backup-2tb",
+      "repositories": {
+        "archive": "backups/archive"
+      }
+    }
+  },
+  "repositories": {
+    "media": {
+      "name": "media",
+      "localPath": "/home/user/media",
+      "type": "MEDIA",
+      "databases": ["catalog.db"],
+      "excludePatterns": ["*.tmp", "*.part", ".DS_Store", "*.!qB"]
+    },
+    "archive": {
+      "name": "archive",
+      "localPath": "/home/user/archive",
+      "type": "ARCHIVE",
+      "databases": ["catalog.sqlite"],
+      "excludePatterns": ["*.tmp", "*.part", ".DS_Store", "*.ytdl"]
+    }
+  },
+  "lockSearchPaths": [
+    "~/data",
+    "~/projects"
+  ],
+  "defaultSyncRules": {
+    "bidirectional": false,
+    "deleteRemoved": false,
+    "conflictResolution": "NEWER_WINS",
+    "bandwidthLimit": 50000,
+    "excludePatterns": ["*.tmp", "*.part", ".DS_Store"]
+  }
+}

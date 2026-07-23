@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Installed copy is rendered by install.sh (__BIN__ / __HOME__ substituted). -->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.choam-autodrain</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__BIN__/choam-autodrain</string>
+    </array>
+
+    <!-- ~90s cadence (inside the 45s-3min band). The guard self-throttles too. -->
+    <key>StartInterval</key>
+    <integer>90</integer>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Low-impact background job. -->
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>LowPriorityIO</key>
+    <true/>
+    <key>Nice</key>
+    <integer>10</integer>
+
+    <!-- launchd hands us a minimal PATH; the guard uses absolute tool paths, but
+         keep /opt/homebrew/bin here so `choam` resolves for the detached drain. -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/choam-autodrain/agent.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/choam-autodrain/agent.err.log</string>
+</dict>
+</plist>

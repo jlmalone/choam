@@ -1,0 +1,213 @@
+#!/bin/bash
+# choam-autodrain: drain the CHOAM queue automatically, but ONLY when the
+# machine is in a known-safe state.
+#
+# Gates (all must hold):
+#   1. Not already draining          (choam's own PID run-lock, cheap, no JVM)
+#   2. darkmesh verdict == GO         (/tmp/darkmesh-status.json)
+#      AND tailscale_ok == true       (choam's destination path is reachable)
+#      AND pf_kill_active == false    (network is "safe", not VPN-down/hotspot)
+#   3. NOT on a hotspot SSID          (same list vpn-guard uses; never burn cellular)
+#   4. Queue has PENDING/FAILED work  AND nothing RUNNING (SQLite, cheap, no JVM)
+#
+# When all gates pass it re-loads the SSH key from the Keychain (the usual reason
+# the queue stalls is the ssh-agent dropping its identities, after which choam
+# reports the destination "unreachable" and defers everything), then runs
+# `choam queue --run` in the foreground so launchd/the supervisor owns its lifetime.
+#
+# It is idempotent, self-throttled (>= CHOAM_AUTODRAIN_INTERVAL seconds between
+# evaluations) and exits 0 after normal evaluations. Exactly one scheduler should call it; choam's
+# internal run-lock remains the final backstop against manual/concurrent drains.
+#
+# Overrides (env): CHOAM, CHOAM_HOME, DARKMESH_STATUS, HOTSPOT_PATTERNS_FILE,
+# CHOAM_AUTODRAIN_INTERVAL, CHOAM_AUTODRAIN_REQUIRE_GO, CHOAM_MAX_RETRIES,
+# CHOAM_AUTODRAIN_SSH_KEY_FILE.
+
+set -uo pipefail
+
+CHOAM="${CHOAM:-/opt/homebrew/bin/choam}"
+CHOAM_HOME="${CHOAM_HOME:-$HOME/.choam}"
+QUEUE_DB="$CHOAM_HOME/transfer_queue.db"
+RUN_LOCK="$CHOAM_HOME/queue-run.lock"
+DARKMESH_STATUS="${DARKMESH_STATUS:-/tmp/darkmesh-status.json}"
+HOTSPOT_FILE="${HOTSPOT_PATTERNS_FILE:-$HOME/.config/vpn-guard/hotspot-ssids.txt}"
+MIN_INTERVAL="${CHOAM_AUTODRAIN_INTERVAL:-90}"
+REQUIRE_GO="${CHOAM_AUTODRAIN_REQUIRE_GO:-1}"
+MAX_RETRIES="${CHOAM_MAX_RETRIES:-5}"
+SSH_KEY_FILE="${CHOAM_AUTODRAIN_SSH_KEY_FILE:-$HOME/.config/choam/autodrain-ssh-keys}"
+
+STATE_DIR="$HOME/.local/state/choam-autodrain"
+STAMP="$STATE_DIR/last-eval"
+STATUS_OUT="$STATE_DIR/status.json"
+LOG_DIR="$HOME/Library/Logs/choam-autodrain"
+LOG="$LOG_DIR/choam-autodrain.log"
+DRAIN_LOG="$LOG_DIR/drain.log"
+
+SQLITE="${SQLITE:-/usr/bin/sqlite3}"
+PY="${PY:-/usr/bin/python3}"
+NETSETUP="${NETSETUP:-/usr/sbin/networksetup}"
+SSH_ADD="${SSH_ADD:-/usr/bin/ssh-add}"
+
+mkdir -p "$STATE_DIR" "$LOG_DIR" 2>/dev/null || true
+
+now() { date +%s; }
+log() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+write_status() { # $1=state  $2=detail
+  "$PY" - "$STATUS_OUT" "$1" "$2" "$MIN_INTERVAL" <<'PY' 2>/dev/null || true
+import datetime, json, os, sys
+path, state, detail, interval = sys.argv[1:]
+payload = {
+    "schema": 1,
+    "armed": True,
+    "state": state,
+    "detail": detail,
+    "checked_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+    "min_interval_s": int(interval),
+}
+tmp = f"{path}.tmp.{os.getpid()}"
+with open(tmp, "w", encoding="utf-8") as fh:
+    json.dump(payload, fh, separators=(",", ":"))
+    fh.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+# --- 1) Throttle: shared stamp so the 10s Protection poll is nearly free -------
+if [[ -f "$STAMP" ]]; then
+  last="$(cat "$STAMP" 2>/dev/null || echo 0)"
+  [[ "$last" =~ ^[0-9]+$ ]] || last=0
+  (( $(now) - last < MIN_INTERVAL )) && exit 0
+fi
+stamp_tmp="$STAMP.tmp.$$"
+printf '%s' "$(now)" > "$stamp_tmp" 2>/dev/null && mv -f "$stamp_tmp" "$STAMP" 2>/dev/null || true
+
+# --- 2) Already draining? choam's run-lock holds the live PID -------------------
+if [[ -f "$RUN_LOCK" ]]; then
+  pid="$(cat "$RUN_LOCK" 2>/dev/null || true)"
+  if [[ "$pid" =~ ^[0-9]+$ ]] && kill -0 "$pid" 2>/dev/null; then
+    write_status draining "drain pid $pid active"; exit 0
+  fi
+fi
+
+# --- 3) darkmesh gate: GO + tailscale up + not fail-closed ---------------------
+if [[ "$REQUIRE_GO" == 1 ]]; then
+  if [[ ! -r "$DARKMESH_STATUS" ]]; then
+    write_status blocked "no darkmesh status"; log "blocked: no $DARKMESH_STATUS"; exit 0
+  fi
+  read -r verdict tailscale pfkill < <("$PY" - "$DARKMESH_STATUS" <<'PY' 2>/dev/null || true
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    print("ERR true true"); sys.exit(0)
+pf = d.get("pf") or {}
+print(d.get("verdict", "?"),
+      str(d.get("tailscale_ok", False)).lower(),
+      str(pf.get("pf_kill_active", False)).lower())
+PY
+)
+  if [[ "$verdict" != "GO" || "$tailscale" != "true" || "$pfkill" == "true" ]]; then
+    write_status blocked "verdict=$verdict tailscale=$tailscale pfkill=$pfkill"
+    log "blocked: verdict=$verdict tailscale=$tailscale pfkill=$pfkill"; exit 0
+  fi
+fi
+
+# --- 4) Hotspot gate: never auto-drain over a phone hotspot (cellular) ----------
+active_wifi_iface() {
+  "$NETSETUP" -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2; exit}'
+}
+current_ssid() {
+  local wifi ssid
+  wifi="$(active_wifi_iface || true)"; [[ -z "$wifi" ]] && return 1
+  ssid="$("$NETSETUP" -getairportnetwork "$wifi" 2>/dev/null | sed -nE 's/^Current Wi-Fi Network: //p')"
+  [[ -n "$ssid" ]] || return 1
+  printf '%s' "$ssid"
+}
+is_hotspot() { # $1=ssid
+  local ssid="$1"; [[ -z "$ssid" ]] && return 1
+  if [[ -s "$HOTSPOT_FILE" ]]; then
+    grep -qiF -f <(grep -vE '^[[:space:]]*(#|$)' "$HOTSPOT_FILE") <<<"$ssid" && return 0
+    return 1
+  fi
+  # Fallback only (used if the SSID file is missing/empty); real per-person
+  # names live in the untracked hotspot-ssids.txt, never in the repo.
+  printf '%s' "$ssid" | grep -qiE 'iphone|android|hotspot|tether|personal|pixel|galaxy|samsung'
+}
+ssid="$(current_ssid || true)"
+if [[ -n "$ssid" ]] && is_hotspot "$ssid"; then
+  write_status blocked "hotspot ssid: $ssid"; log "blocked: hotspot ssid=$ssid"; exit 0
+fi
+
+# --- 5) Any drain candidates? cheap live SQLite read, no JVM --------------------
+# Use a normal WAL-aware connection with query_only enabled. An immutable open can
+# ignore committed rows still present in the WAL, falsely reporting an empty queue.
+if [[ ! -r "$QUEUE_DB" ]]; then
+  write_status blocked "queue db unreadable"; log "blocked: cannot read $QUEUE_DB"; exit 0
+fi
+[[ "$MAX_RETRIES" =~ ^[0-9]+$ ]] || MAX_RETRIES=5
+counts="$("$SQLITE" -noheader -separator '|' -cmd '.timeout 5000' "$QUEUE_DB" \
+  "PRAGMA query_only=ON;
+   SELECT
+     COALESCE(SUM(CASE
+       WHEN status IN ('PENDING','FAILED')
+        AND retry_count <= $MAX_RETRIES
+        AND (next_retry_at IS NULL OR julianday(next_retry_at) <= julianday('now'))
+       THEN 1 ELSE 0 END), 0),
+     COALESCE(SUM(CASE WHEN status='RUNNING' THEN 1 ELSE 0 END), 0)
+   FROM transfer_queue;" 2>>"$LOG")"
+IFS='|' read -r candidates running <<< "$counts"
+# A non-numeric result means the READ FAILED. Never treat that as "empty" (that
+# was the silent-blindness bug); surface it and bail so the next tick retries.
+if ! [[ "$candidates" =~ ^[0-9]+$ && "$running" =~ ^[0-9]+$ ]]; then
+  write_status blocked "queue db read error (cand='$candidates' run='$running')"
+  log "blocked: queue db read error cand='$candidates' run='$running'"; exit 0
+fi
+(( running > 0 ))     && { write_status draining "$running running"; exit 0; }
+(( candidates == 0 )) && { write_status idle "queue empty"; exit 0; }
+
+# --- 6) Gates pass: heal ssh key, then drain under our supervisor ---------------
+load_ssh_key() {
+  local configured="$1" key
+  [[ "$configured" == "~/"* ]] && configured="$HOME/${configured#\~/}"
+  key="$configured"
+  [[ -f "$key" ]] && "$SSH_ADD" --apple-use-keychain "$key" >/dev/null 2>&1 || true
+}
+load_ssh_key "$HOME/.ssh/id_ed25519"
+if [[ -r "$SSH_KEY_FILE" ]]; then
+  while IFS= read -r key; do
+    [[ -z "$key" || "$key" == \#* ]] || load_ssh_key "$key"
+  done < "$SSH_KEY_FILE"
+fi
+
+log "actuating: $candidates eligible, verdict=GO, ssid='${ssid:-}' -> choam queue --run"
+write_status draining "started drain: $candidates pending"
+# Bound the drain log: a flaky remote can make choam spew hundreds of MB of
+# "unreachable -- will retry later". Rotate at ~5MB, keep one previous file.
+if [[ -f "$DRAIN_LOG" ]] && (( $(/usr/bin/stat -f%z "$DRAIN_LOG" 2>/dev/null || echo 0) > 5*1024*1024 )); then
+  mv -f "$DRAIN_LOG" "$DRAIN_LOG.1" 2>/dev/null || true
+fi
+trap '' HUP
+drain_pid=""
+terminate_drain() {
+  if [[ "$drain_pid" =~ ^[0-9]+$ ]] && kill -0 "$drain_pid" 2>/dev/null; then
+    kill -TERM "$drain_pid" 2>/dev/null || true
+    wait "$drain_pid" 2>/dev/null || true
+  fi
+  exit 143
+}
+trap terminate_drain TERM INT
+echo "$(date -u +%FT%TZ) starting choam queue --run (pending=$candidates)" >>"$DRAIN_LOG"
+"$CHOAM" queue --run >>"$DRAIN_LOG" 2>&1 &
+drain_pid=$!
+wait "$drain_pid"
+drain_rc=$?
+drain_pid=""
+trap - TERM INT
+echo "$(date -u +%FT%TZ) choam queue --run exited rc=$drain_rc" >>"$DRAIN_LOG"
+if (( drain_rc == 0 )); then
+  write_status idle "drain completed"
+else
+  write_status blocked "drain exited rc=$drain_rc"
+fi
+exit "$drain_rc"

@@ -1,0 +1,125 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout CHOAM
+        uses: actions/checkout@v6
+        with:
+          path: choam
+          fetch-depth: 0
+
+      - name: Checkout sietch (composite build dependency)
+        uses: actions/checkout@v6
+        with:
+          repository: jlmalone/sietch
+          path: sietch
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v5
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Validate release version
+        id: version
+        working-directory: choam
+        run: |
+          set -euo pipefail
+          BASE=${GITHUB_REF_NAME#v}
+          VERSION=$(tr -d '[:space:]' < VERSION)
+          VERSION_BASE=${VERSION%.*}
+          BUILD=${VERSION##*.}
+          if [[ "$VERSION_BASE" != "$BASE" || ! "$BUILD" =~ ^[0-9]+$ ]]; then
+            echo "VERSION must use tag base ${BASE} followed by a monotonic build number" >&2
+            exit 1
+          fi
+          echo "VERSION=${VERSION}" >> $GITHUB_OUTPUT
+          echo "Version: ${VERSION}"
+
+      - name: Run tests
+        working-directory: choam
+        run: ./gradlew test
+
+      - name: Build distribution
+        working-directory: choam
+        run: ./gradlew distZip
+
+      - name: Compute SHA256 of release zip
+        id: sha
+        run: echo "SHA256=$(shasum -a 256 choam/build/distributions/choam-${{ steps.version.outputs.VERSION }}.zip | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Upload zip to homebrew-tap release
+        env:
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          ZIP=choam/build/distributions/choam-${VERSION}.zip
+          TAG=choam-v${VERSION}
+
+          gh release create "$TAG" \
+            --repo jlmalone/homebrew-tap \
+            --title "CHOAM ${VERSION}" \
+            --notes "Cross-machine file synchronization for large media repositories." \
+            "$ZIP" || \
+          gh release upload "$TAG" "$ZIP" \
+            --repo jlmalone/homebrew-tap \
+            --clobber
+
+      - name: Update Homebrew formula
+        env:
+          GH_TOKEN: ${{ secrets.REPO_ACCESS_TOKEN }}
+        run: |
+          VERSION=${{ steps.version.outputs.VERSION }}
+          SHA=${{ steps.sha.outputs.SHA256 }}
+
+          git clone https://x-access-token:${GH_TOKEN}@github.com/jlmalone/homebrew-tap.git /tmp/homebrew-tap
+          cd /tmp/homebrew-tap
+
+          cat > Formula/choam.rb << EOF
+          class Choam < Formula
+            desc "Cross-machine file synchronization for large media repositories"
+            homepage "https://github.com/jlmalone/choam"
+            version "${VERSION}"
+            url "https://github.com/jlmalone/homebrew-tap/releases/download/choam-v#{version}/choam-#{version}.zip"
+            sha256 "${SHA}"
+            license "MIT"
+
+            depends_on "openjdk@21"
+
+            def install
+              # Remove Windows batch file
+              rm "bin/choam.bat"
+
+              # Fix the shell script to use Homebrew's JDK
+              inreplace "bin/choam", /^#!.*/, "#!/bin/bash"
+
+              libexec.install Dir["*"]
+
+              # Set JAVA_HOME in the wrapper script
+              env = Language::Java.overridable_java_home_env("21")
+              (bin/"choam").write_env_script libexec/"bin/choam", env
+            end
+
+            test do
+              assert_match "Cross-Host Orchestrated Asset Management", shell_output("#{bin}/choam --help")
+            end
+          end
+          EOF
+
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git add Formula/choam.rb
+          git commit -m "Update choam to v${VERSION}"
+          git push

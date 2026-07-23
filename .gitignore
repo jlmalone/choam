@@ -1,0 +1,27 @@
+/.gradle/
+/build/
+/out/
+/.idea/
+/local.properties
+gradle.properties
+*.iml
+*.log
+
+# Personal infrastructure docs (kept locally, not for public)
+# These contain Tailscale IPs, SSH usernames, machine inventory, AI-agent instructions
+AI.local.md
+CLAUDE.md
+OVERWRITE_SAFETY_PLAN.md
+ECOSYSTEM.md
+PROPOSAL.md
+CONTENT_PROXY_PROPOSAL.md
+CHOAM_USAGE_GUIDE.md
+CLAUDE_SESSIONS_ARCHIVE/
+CLAUDE_SESSION_*.md
+RESUME_CLAUDE.md
+ROADMAP.local.md
+
+# Runtime / local config
+*.env
+config.json
+*.db
