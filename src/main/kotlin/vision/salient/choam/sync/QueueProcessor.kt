@@ -94,9 +94,7 @@ class QueueProcessor(
                 }
             } catch (e: Exception) {
                 logger.error(e) { "Unexpected error processing ${entry.id}" }
-                queue.update(entry.id) {
-                    it.copy(status = TransferStatus.FAILED, error = "Internal error: ${e.message}")
-                }
+                failWithBackoff(entry, "Internal error: ${e.message}")
                 failed++
             }
         }
@@ -115,13 +113,11 @@ class QueueProcessor(
      * Mark an entry FAILED with bounded-retry semantics: increment the retry counter and
      * schedule exponential backoff, or give up once MAX_RETRIES is exceeded.
      *
-     * Verification failures (layout/hash mismatch) are deterministic — without a retry bump
-     * the entry keeps retry_count=0 / next_retry_at=NULL and claimNext() re-claims it
-     * instantly, spinning in a tight loop (this is what produced 10k+ retries on a single
-     * mis-placed directory). Routing every verification FAILED transition through here lets
-     * the existing claimNext() cap + backoff actually take effect.
+     * Any bare FAILED transition remains immediately claimable. Routing every deterministic
+     * processing failure through this method prevents one bad entry from spinning and
+     * starving the rest of the queue.
      */
-    private fun failVerificationWithBackoff(entry: TransferQueueEntry, message: String, bytes: Long? = null) {
+    private fun failWithBackoff(entry: TransferQueueEntry, message: String, bytes: Long? = null) {
         val newRetryCount = entry.retryCount + 1
         val exhausted = newRetryCount > TransferQueueEntry.MAX_RETRIES
         val nextRetry = if (exhausted) null else TransferQueueEntry.nextBackoff(newRetryCount)
@@ -166,7 +162,7 @@ class QueueProcessor(
         val remoteMachine = config.machines[entry.destinationMachine]
         if (remoteMachine == null) {
             echo("  ${entry.id}: unknown machine '${entry.destinationMachine}'")
-            queue.update(entry.id) { it.copy(status = TransferStatus.FAILED, error = "Unknown machine") }
+            failWithBackoff(entry, "Unknown machine")
             return SingleResult.FAILED
         }
 
@@ -178,7 +174,7 @@ class QueueProcessor(
             // immediately and the drain spins on it, never reaching the others — the queue
             // looks frozen. Backoff makes the drain skip past to other transfers and lets a
             // permanently-missing source exhaust its retries and drop out of contention.
-            failVerificationWithBackoff(entry, "Source not found")
+            failWithBackoff(entry, "Source not found")
             return SingleResult.FAILED
         }
 
@@ -186,9 +182,7 @@ class QueueProcessor(
         val connectivity = networkDetector.testConnectivity(route)
         if (!connectivity.reachable) {
             echo("  ${entry.id}: ${remoteMachine.name} unreachable — will retry later")
-            // Reset from RUNNING back to PENDING so it's picked up next cycle
-            queue.update(entry.id) { it.copy(status = TransferStatus.PENDING, startedAt = null,
-                error = "Deferred: ${remoteMachine.name} unreachable") }
+            queue.defer(entry.id, "${remoteMachine.name} unreachable")
             return SingleResult.DEFERRED
         }
 
@@ -197,7 +191,7 @@ class QueueProcessor(
             SourceGuard.acquire(entry.sourcePath, entry.mode, entry.id)
         } catch (e: SourceGuardException) {
             echo("  ${entry.id}: SourceGuard: ${e.message}")
-            queue.update(entry.id) { it.copy(status = TransferStatus.FAILED, error = "[SG_ACQUIRE] ${e.message}") }
+            failWithBackoff(entry, "[SG_ACQUIRE] ${e.message}")
             return SingleResult.FAILED
         }
 
@@ -207,7 +201,7 @@ class QueueProcessor(
                 guard.checkpointAndVerifyWal()
             } catch (e: SourceGuardException) {
                 echo("  ${entry.id}: SQLite not quiescent: ${e.message}")
-                queue.update(entry.id) { it.copy(status = TransferStatus.FAILED, error = "[SG_WAL] ${e.message}") }
+                failWithBackoff(entry, "[SG_WAL] ${e.message}")
                 guard.close()
                 return SingleResult.FAILED
             }
@@ -252,14 +246,13 @@ class QueueProcessor(
                 echo("  ${entry.id}: pre-flight unsafe — ${preflightOutcome.reason}")
                 // Backoff (not a bare FAILED) so a persistently-unsafe/timing-out pre-flight
                 // can't be instantly re-claimed and spin the drain on one entry.
-                failVerificationWithBackoff(entry, preflightOutcome.reason)
+                failWithBackoff(entry, preflightOutcome.reason)
                 return SingleResult.FAILED
             }
             is PreflightOutcome.FallThrough -> {
                 // SSH unreachable for pre-flight — defer rather than proceeding blind
                 echo("  ${entry.id}: pre-flight SSH unreachable — deferring")
-                queue.update(entry.id) { it.copy(status = TransferStatus.PENDING, startedAt = null,
-                    error = "Deferred: pre-flight SSH unreachable") }
+                queue.defer(entry.id, "pre-flight SSH unreachable")
                 return SingleResult.DEFERRED
             }
             is PreflightOutcome.Resolved -> {
@@ -274,7 +267,7 @@ class QueueProcessor(
                     // drain moves on to other transfers and this entry exhausts its retries instead.
                     val conflictNames = preflight.conflictFiles.take(3).joinToString { File(it.localPath).name }
                     echo("  ${entry.id}: CONFLICT — ${preflight.conflictFiles.size} destination file(s) differ: $conflictNames")
-                    failVerificationWithBackoff(entry,
+                    failWithBackoff(entry,
                         "Conflict: ${preflight.conflictFiles.size} destination file(s) exist with different content ($conflictNames). " +
                             "Use --force to overwrite or --backup to preserve the remote copies.")
                     return SingleResult.FAILED
@@ -284,9 +277,7 @@ class QueueProcessor(
                     val backupOk = SendPreflight.backupRemoteFiles(preflight.conflictFiles, remoteMachine, route)
                     if (!backupOk) {
                         echo("  ${entry.id}: remote backup failed — refusing to overwrite without backup")
-                        queue.update(entry.id) {
-                            it.copy(status = TransferStatus.FAILED, error = "Remote backup failed — refusing to overwrite without backup")
-                        }
+                        failWithBackoff(entry, "Remote backup failed — refusing to overwrite without backup")
                         return SingleResult.FAILED
                     }
                 }
@@ -299,9 +290,7 @@ class QueueProcessor(
                         val sourceCheck = guard.verifySourceUnchanged()
                         if (!sourceCheck.passed) {
                             echo("  ${entry.id}: source changed since guard: ${sourceCheck.detail} — source kept")
-                            queue.update(entry.id) {
-                                it.copy(status = TransferStatus.FAILED, error = "[SG_VERIFY] Source changed: ${sourceCheck.detail}")
-                            }
+                            failWithBackoff(entry, "[SG_VERIFY] Source changed: ${sourceCheck.detail}")
                             return SingleResult.FAILED
                         }
 
@@ -310,9 +299,7 @@ class QueueProcessor(
                             val quiescentCheck = guard.verifySqliteMoveQuiescent()
                             if (!quiescentCheck.passed) {
                                 echo("  ${entry.id}: SQLite modified: ${quiescentCheck.detail} — source kept")
-                                queue.update(entry.id) {
-                                    it.copy(status = TransferStatus.FAILED, error = "[SG_VERIFY] SQLite modified: ${quiescentCheck.detail}")
-                                }
+                                failWithBackoff(entry, "[SG_VERIFY] SQLite modified: ${quiescentCheck.detail}")
                                 return SingleResult.FAILED
                             }
                         }
@@ -346,7 +333,7 @@ class QueueProcessor(
                             }
                             if (!authoritative) {
                                 echo("  ${entry.id}: ${unverified.size}/$totalFiles file(s) not confirmed byte-identical at destination — source kept")
-                                failVerificationWithBackoff(entry,
+                                failWithBackoff(entry,
                                     "Move aborted: destination copy not confirmed byte-identical (${unverified.size}/$totalFiles file(s) unproven)")
                                 return SingleResult.FAILED
                             }
@@ -375,7 +362,7 @@ class QueueProcessor(
                             val survivors = survivingSourceFiles(srcFile)
                             if (survivors.isNotEmpty()) {
                                 echo("  ${entry.id}: ${survivors.size} source file(s) survived deletion — destination copy is verified/safe, source kept")
-                                failVerificationWithBackoff(entry,
+                                failWithBackoff(entry,
                                     "Move incomplete: ${survivors.size} source file(s) could not be deleted " +
                                         "(destination copy is verified and safe): ${survivors.take(3).joinToString { it.name }}")
                                 return SingleResult.FAILED
@@ -534,10 +521,11 @@ class QueueProcessor(
                 val sourceCheck = guard.verifySourceUnchanged()
                 if (!sourceCheck.passed) {
                     echo("  ${entry.id}: source changed during transfer: ${sourceCheck.detail}")
-                    queue.update(entry.id) {
-                        it.copy(status = TransferStatus.FAILED, error = "[SG_VERIFY] Source changed during transfer: ${sourceCheck.detail}",
-                            bytesTransferred = bytes)
-                    }
+                    failWithBackoff(
+                        entry,
+                        "[SG_VERIFY] Source changed during transfer: ${sourceCheck.detail}",
+                        bytes
+                    )
                     return SingleResult.FAILED
                 }
 
@@ -551,10 +539,11 @@ class QueueProcessor(
                         val quiescentCheck = guard.verifySqliteMoveQuiescent()
                         if (!quiescentCheck.passed) {
                             echo("  ${entry.id}: SQLite modified during transfer: ${quiescentCheck.detail} — source kept")
-                            queue.update(entry.id) {
-                                it.copy(status = TransferStatus.FAILED, error = "[SG_VERIFY] SQLite modified: ${quiescentCheck.detail}",
-                                    bytesTransferred = bytes)
-                            }
+                            failWithBackoff(
+                                entry,
+                                "[SG_VERIFY] SQLite modified: ${quiescentCheck.detail}",
+                                bytes
+                            )
                             return SingleResult.FAILED
                         }
                     }
@@ -652,7 +641,7 @@ class QueueProcessor(
                 if (moveVerificationFailed) {
                     // Transfer succeeded but MOVE verification failed — mark FAILED, not COMPLETED.
                     // Bounded retry + backoff so a deterministic verify failure can't spin forever.
-                    failVerificationWithBackoff(entry,
+                    failWithBackoff(entry,
                         moveVerificationError ?: "Move verification failed", bytes)
                     historyStore.record(SyncSession(
                         sourceMachine = localMachine.name,

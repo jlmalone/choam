@@ -522,6 +522,40 @@ class TransferQueueStore(
         publishStatusSnapshot()
     }
 
+    /**
+     * Return a claimed entry to PENDING with bounded exponential backoff.
+     *
+     * A deferred entry must not remain immediately claimable. Otherwise the same
+     * unreachable destination is reclaimed in a tight loop and starves every
+     * later queue entry.
+     */
+    fun defer(id: String, reason: String): Boolean {
+        val deferred = getConnection().use { conn ->
+            val entry = loadById(conn, id) ?: return@use false
+            if (entry.status != TransferStatus.RUNNING) return@use false
+            val retryCount = (entry.retryCount + 1).coerceAtMost(TransferQueueEntry.MAX_RETRIES)
+            val nextRetryAt = TransferQueueEntry.nextBackoff(retryCount).toString()
+            conn.prepareStatement("""
+                UPDATE transfer_queue
+                SET status = 'PENDING',
+                    started_at = NULL,
+                    error = ?,
+                    retry_count = ?,
+                    next_retry_at = ?,
+                    pid = NULL
+                WHERE id = ? AND status = 'RUNNING'
+            """.trimIndent()).use { ps ->
+                ps.setString(1, "Deferred: $reason")
+                ps.setInt(2, retryCount)
+                ps.setString(3, nextRetryAt)
+                ps.setString(4, id)
+                ps.executeUpdate() == 1
+            }
+        }
+        if (deferred) publishStatusSnapshot()
+        return deferred
+    }
+
     /** Publish the lightweight status contract consumed by menu-bar monitors. */
     fun publishStatusSnapshot() {
         try {

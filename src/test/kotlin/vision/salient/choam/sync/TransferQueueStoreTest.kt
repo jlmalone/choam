@@ -223,6 +223,37 @@ class TransferQueueStoreTest {
     }
 
     @Test
+    fun `defer returns a running entry to pending with future backoff`() {
+        store.add(entry())
+        assertNotNull(store.claimNext())
+
+        assertTrue(store.defer("test1234", "server-b unreachable"))
+
+        val deferred = store.loadAll().single()
+        assertEquals(TransferStatus.PENDING, deferred.status)
+        assertNull(deferred.startedAt)
+        assertEquals("Deferred: server-b unreachable", deferred.error)
+        assertEquals(1, deferred.retryCount)
+        assertNotNull(deferred.nextRetryAt)
+        assertTrue(Instant.parse(deferred.nextRetryAt).isAfter(Instant.now()))
+        assertNull(store.claimNext(), "deferred entry must not be reclaimed before its backoff expires")
+    }
+
+    @Test
+    fun `repeated deferral caps retry count without exhausting transient work`() {
+        store.add(entry())
+        store.update("test1234") { it.copy(retryCount = TransferQueueEntry.MAX_RETRIES) }
+        assertNotNull(store.claimNext())
+
+        assertTrue(store.defer("test1234", "server-b unreachable"))
+
+        val deferred = store.loadAll().single()
+        assertEquals(TransferStatus.PENDING, deferred.status)
+        assertEquals(TransferQueueEntry.MAX_RETRIES, deferred.retryCount)
+        assertNotNull(deferred.nextRetryAt)
+    }
+
+    @Test
     fun `claimNext respects priority order`() {
         store.add(entry(id = "low12345", priority = TransferPriority.LOW, source = "/tmp/a"))
         store.add(entry(id = "high1234", priority = TransferPriority.HIGH, source = "/tmp/b"))
