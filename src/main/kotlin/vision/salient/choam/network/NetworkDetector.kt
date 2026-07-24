@@ -243,7 +243,7 @@ class NetworkDetector {
             "galaxy",
             "hotspot",
             "mobile hotspot",
-            "matthew"  // Matthew's iPhone
+            "personal hotspot"
         )
 
         /**

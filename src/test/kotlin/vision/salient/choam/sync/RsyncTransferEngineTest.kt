@@ -230,15 +230,15 @@ class RsyncTransferEngineTest {
 
     @Test
     fun `appendSourceSlash false keeps dotless directory source without trailing slash`() {
-        // Regression: dotless directory names (e.g. "sol-bianca-the-legacy") were given a
+        // Regression: dotless directory names (e.g. "sample-collection") were given a
         // trailing slash by the legacy heuristic, dumping contents into the parent instead of
         // creating <target>/<basename> — which then failed post-transfer verification forever.
         val cmd = engine.buildRsyncCommand(
-            sourcePath = "/src/sol-bianca-the-legacy",
-            targetPath = "/dst/cinemaphile_data/",
+            sourcePath = "/src/sample-collection",
+            targetPath = "/dst/media_library/",
             appendSourceSlash = false
         )
-        assertEquals("/src/sol-bianca-the-legacy", cmd[cmd.size - 2],
+        assertEquals("/src/sample-collection", cmd[cmd.size - 2],
             "Source must NOT get a trailing slash so rsync creates <target>/<basename>")
     }
 
@@ -262,13 +262,13 @@ class RsyncTransferEngineTest {
             mode = NetworkMode.TAILSCALE, sourceAddress = "100.64.0.1", targetAddress = "100.64.0.2"
         )
         val cmd = engine.buildRsyncCommand(
-            sourcePath = "/data/[Pog42] Elfen Lied (BD)",
+            sourcePath = "/data/Sample Collection (BD)",
             targetPath = "/backup/",
             sourceMachine = machine,
             route = route,
             appendSourceSlash = false
         )
-        assertEquals("joe@100.64.0.1:/data/[Pog42] Elfen Lied (BD)", cmd[cmd.size - 2],
+        assertEquals("joe@100.64.0.1:/data/Sample Collection (BD)", cmd[cmd.size - 2],
             "Remote source must keep its user@host: prefix and have no trailing slash")
     }
 

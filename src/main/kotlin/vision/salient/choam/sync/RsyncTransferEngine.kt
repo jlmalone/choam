@@ -267,7 +267,7 @@ class RsyncTransferEngine {
         // ManifestWriter.resolveRemoteDirPath + PostTransferVerifier), so they MUST pass
         // appendSourceSlash=false. When null we fall back to the legacy name-based heuristic,
         // which guesses file-vs-dir from a dot in the name — unreliable (it broke dotless
-        // directory names like "sol-bianca-the-legacy"), but preserved for sync/push/pull/move
+        // directory names like "sample-collection"), but preserved for sync/push/pull/move
         // callers that depend on content-merge semantics.
         val sourceArg = when (appendSourceSlash) {
             false -> stripTrailingSlash(sourceSpec)
