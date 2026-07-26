@@ -14,7 +14,8 @@ class NetworkDetectorTest {
     private fun createMachine(
         name: String,
         hostname: String,
-        tailscaleIp: String? = null
+        tailscaleIp: String? = null,
+        networkPreference: NetworkMode = NetworkMode.AUTO
     ): MachineProfile =
         MachineProfile(
             name = name,
@@ -24,7 +25,7 @@ class NetworkDetectorTest {
             sshUser = null,
             sshPort = 22,
             tailscaleIp = tailscaleIp,
-            networkPreference = NetworkMode.AUTO
+            networkPreference = networkPreference
         )
 
     @Test
@@ -51,6 +52,42 @@ class NetworkDetectorTest {
         assertEquals(NetworkMode.TAILSCALE, route.mode)
         assertEquals("100.64.1.10", route.sourceAddress)
         assertEquals("100.64.1.20", route.targetAddress)
+    }
+
+    @Test
+    fun `honors LAN preference when both machines have Tailscale IPs`() {
+        val detector = NetworkDetector()
+        val source = createMachine("source", "source.local", tailscaleIp = "100.64.1.10")
+        val target = createMachine(
+            "target",
+            "target.local",
+            tailscaleIp = "100.64.1.20",
+            networkPreference = NetworkMode.LAN
+        )
+
+        val route = detector.detectBestRoute(source, target)
+
+        assertEquals(NetworkMode.LAN, route.mode)
+        assertEquals("source.local", route.sourceAddress)
+        assertEquals("target.local", route.targetAddress)
+    }
+
+    @Test
+    fun `falls back to LAN when Tailscale is preferred but unavailable`() {
+        val detector = NetworkDetector()
+        val source = createMachine("source", "source.local")
+        val target = createMachine(
+            "target",
+            "target.local",
+            tailscaleIp = "100.64.1.20",
+            networkPreference = NetworkMode.TAILSCALE
+        )
+
+        val route = detector.detectBestRoute(source, target)
+
+        assertEquals(NetworkMode.LAN, route.mode)
+        assertEquals("source.local", route.sourceAddress)
+        assertEquals("target.local", route.targetAddress)
     }
 
     @Test

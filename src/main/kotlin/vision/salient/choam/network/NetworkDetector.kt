@@ -183,9 +183,14 @@ class NetworkDetector {
         source: MachineProfile,
         target: MachineProfile
     ): NetworkRoute {
-        val mode = when {
-            source.tailscaleIp != null && target.tailscaleIp != null -> NetworkMode.TAILSCALE
-            else -> NetworkMode.LAN
+        val tailscaleAvailable = source.tailscaleIp != null && target.tailscaleIp != null
+        val mode = when (target.networkPreference) {
+            NetworkMode.LAN -> NetworkMode.LAN
+            NetworkMode.WAN -> NetworkMode.WAN
+            NetworkMode.TAILSCALE ->
+                if (tailscaleAvailable) NetworkMode.TAILSCALE else NetworkMode.LAN
+            NetworkMode.AUTO ->
+                if (tailscaleAvailable) NetworkMode.TAILSCALE else NetworkMode.LAN
         }
 
         val sourceAddress =
