@@ -282,34 +282,16 @@ class CatalogIndex(private val dbPath: String) {
      * catalog_sources and files tables, then rebuilds the FTS index.
      *
      * @param conn An open connection to this CatalogIndex database
-     * @param registryDbPath Path to the unified_registry.db
+     * @param registryDbPath Path to a Sietch registry or CHOAM unified registry
      * @param driveConfig Drive config from ChoamConfig for drive_label derivation
      * @return Number of files indexed
      */
     fun rebuildFromRegistry(conn: Connection, registryDbPath: String, driveConfig: Map<String, Drive>, machineNameMap: Map<String, String> = emptyMap()): Long {
         val registryFile = File(registryDbPath)
         if (!registryFile.exists()) {
-            logger.warn { "Unified registry not found at $registryDbPath" }
+            logger.warn { "Registry not found at $registryDbPath" }
             return 0
         }
-
-        val regConn = DriverManager.getConnection("jdbc:sqlite:$registryDbPath")
-        regConn.createStatement().executeUpdate("PRAGMA query_only=ON")
-
-        // Build mount-point lookup from drive config
-        val mountPointMap = buildMountPointMap(driveConfig)
-
-        // Build ignore matchers from default exclude patterns + CHOAM extras
-        val choamExcludePatterns = listOf("._*") // macOS AppleDouble resource forks on exFAT/NTFS
-        val allExcludePatterns = DEFAULT_EXCLUDE_PATTERNS + choamExcludePatterns
-        val ignoreMatchers = allExcludePatterns.map { pattern ->
-            FileSystems.getDefault().getPathMatcher("glob:$pattern")
-        }
-
-        // Read all entries grouped by (machine, drive_label)
-        val rs = regConn.createStatement().executeQuery(
-            "SELECT cid, machine_name, file_path, file_size, registered_at, last_synced_at FROM content_locations"
-        )
 
         data class RegistryEntry(
             val cid: String,
@@ -321,22 +303,65 @@ class CatalogIndex(private val dbPath: String) {
         )
 
         val entries = mutableListOf<RegistryEntry>()
-        while (rs.next()) {
-            val originalMachine = rs.getString("machine_name")
-            val remappedMachine = machineNameMap[originalMachine] ?: originalMachine
-            entries.add(RegistryEntry(
-                cid = rs.getString("cid"),
-                machineName = remappedMachine,
-                filePath = rs.getString("file_path"),
-                fileSize = rs.getLong("file_size"),
-                registeredAt = rs.getString("registered_at") ?: "",
-                lastSyncedAt = rs.getString("last_synced_at") ?: ""
-            ))
-        }
-        rs.close()
-        regConn.close()
+        val regConn = DriverManager.getConnection("jdbc:sqlite:$registryDbPath")
+        try {
+            regConn.createStatement().use { it.executeUpdate("PRAGMA query_only=ON") }
 
-        if (entries.isEmpty()) return 0
+            // Sietch's public registry schema has registered_at, while CHOAM's
+            // unified registry adds last_synced_at. Accept both without requiring
+            // a CHOAM-specific migration on a read-only Sietch inventory.
+            val columns = mutableSetOf<String>()
+            regConn.createStatement().use { stmt ->
+                stmt.executeQuery("PRAGMA table_info(content_locations)").use { rs ->
+                    while (rs.next()) {
+                        columns.add(rs.getString("name").lowercase())
+                    }
+                }
+            }
+            val requiredColumns = setOf("cid", "machine_name", "file_path", "file_size", "registered_at")
+            require(requiredColumns.all { it in columns }) {
+                "Registry content_locations table is missing required Sietch columns"
+            }
+            val lastSyncedAtExpression = if ("last_synced_at" in columns) {
+                "last_synced_at"
+            } else {
+                // A direct Sietch registry has no sync watermark. Its registration
+                // time is the freshest available inventory observation.
+                "registered_at"
+            }
+
+            regConn.createStatement().use { stmt ->
+                stmt.executeQuery(
+                    "SELECT cid, machine_name, file_path, file_size, registered_at, " +
+                        "$lastSyncedAtExpression AS last_synced_at FROM content_locations"
+                ).use { rs ->
+                    while (rs.next()) {
+                        val originalMachine = rs.getString("machine_name")
+                        val remappedMachine = machineNameMap[originalMachine] ?: originalMachine
+                        entries.add(RegistryEntry(
+                            cid = rs.getString("cid"),
+                            machineName = remappedMachine,
+                            filePath = rs.getString("file_path"),
+                            fileSize = rs.getLong("file_size"),
+                            registeredAt = rs.getString("registered_at") ?: "",
+                            lastSyncedAt = rs.getString("last_synced_at") ?: ""
+                        ))
+                    }
+                }
+            }
+        } finally {
+            regConn.close()
+        }
+
+        // Build mount-point lookup from drive config
+        val mountPointMap = buildMountPointMap(driveConfig)
+
+        // Build ignore matchers from default exclude patterns + CHOAM extras
+        val choamExcludePatterns = listOf("._*") // macOS AppleDouble resource forks on exFAT/NTFS
+        val allExcludePatterns = DEFAULT_EXCLUDE_PATTERNS + choamExcludePatterns
+        val ignoreMatchers = allExcludePatterns.map { pattern ->
+            FileSystems.getDefault().getPathMatcher("glob:$pattern")
+        }
 
         // Filter out ignored paths (macOS metadata, temp files)
         val filtered = entries.filter { entry ->
@@ -350,8 +375,6 @@ class CatalogIndex(private val dbPath: String) {
             }
             !filenameExcluded && !dirExcluded
         }
-
-        if (filtered.isEmpty()) return 0
 
         // Deduplicate: for each (machine_name, file_path), keep only the row with latest registered_at.
         // The unified registry PK is (cid, machine_name, file_path), so the same path can appear
@@ -381,60 +404,75 @@ class CatalogIndex(private val dbPath: String) {
         }
 
         val stmt = conn.createStatement()
-        stmt.executeUpdate("BEGIN")
-
-        // Remove old registry-sourced data (sources with hash_algorithm = 'registry')
-        stmt.executeUpdate("DELETE FROM files WHERE source_id IN (SELECT id FROM catalog_sources WHERE hash_algorithm = 'registry')")
-        stmt.executeUpdate("DELETE FROM catalog_sources WHERE hash_algorithm = 'registry'")
-
-        val sourceInsert = conn.prepareStatement(
-            "INSERT INTO catalog_sources (drive_label, machine, root_path, catalog_date, hash_algorithm, file_count, total_size) " +
-            "VALUES (?, ?, ?, datetime('now'), 'registry', ?, ?)"
-        )
-        val fileInsert = conn.prepareStatement(
-            "INSERT INTO files (source_id, path, filename, extension, hash, cid, size, last_synced_at) VALUES (?, ?, ?, ?, '-', ?, ?, ?)"
-        )
-
         var totalFiles = 0L
+        var transactionStarted = false
+        try {
+            stmt.executeUpdate("BEGIN")
+            transactionStarted = true
 
-        for ((sourceKey, sourceEntries) in grouped) {
-            val totalSize = sourceEntries.sumOf { it.fileSize }
+            // Replace the registry projection atomically. A valid empty snapshot
+            // must clear prior registry rows rather than leave stale search hits.
+            stmt.executeUpdate("DELETE FROM files WHERE source_id IN (SELECT id FROM catalog_sources WHERE hash_algorithm = 'registry')")
+            stmt.executeUpdate("DELETE FROM catalog_sources WHERE hash_algorithm = 'registry'")
 
-            sourceInsert.setString(1, sourceKey.driveLabel)
-            sourceInsert.setString(2, sourceKey.machine)
-            sourceInsert.setString(3, sourceKey.driveLabel) // root_path = drive label for registry sources
-            sourceInsert.setInt(4, sourceEntries.size)
-            sourceInsert.setLong(5, totalSize)
-            sourceInsert.executeUpdate()
+            conn.prepareStatement(
+                "INSERT INTO catalog_sources (drive_label, machine, root_path, catalog_date, hash_algorithm, file_count, total_size) " +
+                    "VALUES (?, ?, ?, datetime('now'), 'registry', ?, ?)"
+            ).use { sourceInsert ->
+                conn.prepareStatement(
+                    "INSERT INTO files (source_id, path, filename, extension, hash, cid, size, last_synced_at) VALUES (?, ?, ?, ?, '-', ?, ?, ?)"
+                ).use { fileInsert ->
+                    for ((sourceKey, sourceEntries) in grouped) {
+                        val totalSize = sourceEntries.sumOf { it.fileSize }
 
-            val idRs = conn.createStatement().executeQuery("SELECT last_insert_rowid()")
-            idRs.next()
-            val sourceId = idRs.getInt(1)
-            idRs.close()
+                        sourceInsert.setString(1, sourceKey.driveLabel)
+                        sourceInsert.setString(2, sourceKey.machine)
+                        sourceInsert.setString(3, sourceKey.driveLabel) // root_path = drive label for registry sources
+                        sourceInsert.setInt(4, sourceEntries.size)
+                        sourceInsert.setLong(5, totalSize)
+                        sourceInsert.executeUpdate()
 
-            for (entry in sourceEntries) {
-                val filename = entry.filePath.substringAfterLast("/").substringAfterLast("\\")
-                val extension = if (filename.contains(".")) filename.substringAfterLast(".").lowercase() else ""
+                        val sourceId = conn.createStatement().use { idStmt ->
+                            idStmt.executeQuery("SELECT last_insert_rowid()").use { idRs ->
+                                idRs.next()
+                                idRs.getInt(1)
+                            }
+                        }
 
-                fileInsert.setInt(1, sourceId)
-                fileInsert.setString(2, entry.filePath)
-                fileInsert.setString(3, filename)
-                fileInsert.setString(4, extension)
-                fileInsert.setString(5, entry.cid)
-                fileInsert.setLong(6, entry.fileSize)
-                fileInsert.setString(7, entry.lastSyncedAt)
-                fileInsert.executeUpdate()
-                totalFiles++
+                        for (entry in sourceEntries) {
+                            val filename = entry.filePath.substringAfterLast("/").substringAfterLast("\\")
+                            val extension = if (filename.contains(".")) filename.substringAfterLast(".").lowercase() else ""
+
+                            fileInsert.setInt(1, sourceId)
+                            fileInsert.setString(2, entry.filePath)
+                            fileInsert.setString(3, filename)
+                            fileInsert.setString(4, extension)
+                            fileInsert.setString(5, entry.cid)
+                            fileInsert.setLong(6, entry.fileSize)
+                            fileInsert.setString(7, entry.lastSyncedAt)
+                            fileInsert.executeUpdate()
+                            totalFiles++
+                        }
+                    }
+                }
             }
+
+            // Keep the external-content FTS table in the same transaction as its source rows.
+            stmt.executeUpdate("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
+            stmt.executeUpdate("COMMIT")
+            transactionStarted = false
+        } catch (e: Exception) {
+            if (transactionStarted) {
+                try {
+                    stmt.executeUpdate("ROLLBACK")
+                } catch (_: Exception) {
+                    // The original failure is the useful diagnostic.
+                }
+            }
+            throw e
+        } finally {
+            stmt.close()
         }
-
-        sourceInsert.close()
-        fileInsert.close()
-        stmt.executeUpdate("COMMIT")
-
-        // Rebuild FTS index
-        stmt.executeUpdate("INSERT INTO files_fts(files_fts) VALUES('rebuild')")
-        stmt.close()
 
         logger.info { "Rebuilt CatalogIndex from registry: $totalFiles files across ${grouped.size} sources" }
         return totalFiles

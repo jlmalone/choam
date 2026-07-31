@@ -5,6 +5,7 @@ import org.junit.jupiter.api.io.TempDir
 import java.nio.file.Path
 import java.sql.DriverManager
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -76,6 +77,53 @@ class CatalogIndexRegistryTest {
         conn.close()
     }
 
+    /** Matches Sietch's public content_locations table without CHOAM's sync column. */
+    private fun createSietchRegistry(path: String, entries: List<TimestampedRegistryEntry>) {
+        val conn = DriverManager.getConnection("jdbc:sqlite:$path")
+        val stmt = conn.createStatement()
+        stmt.executeUpdate("PRAGMA journal_mode=WAL")
+        stmt.executeUpdate("""
+            CREATE TABLE content_locations (
+                cid TEXT NOT NULL,
+                machine_name TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                file_size INTEGER,
+                verified_at TEXT,
+                registered_at TEXT NOT NULL DEFAULT (datetime('now')),
+                PRIMARY KEY (cid, machine_name, file_path)
+            )
+        """)
+        val insert = conn.prepareStatement(
+            "INSERT INTO content_locations (cid, machine_name, file_path, file_size, registered_at) VALUES (?, ?, ?, ?, ?)"
+        )
+        for (entry in entries) {
+            insert.setString(1, entry.cid)
+            insert.setString(2, entry.machine)
+            insert.setString(3, entry.filePath)
+            insert.setLong(4, entry.fileSize)
+            insert.setString(5, entry.registeredAt)
+            insert.executeUpdate()
+        }
+        insert.close()
+        stmt.close()
+        conn.close()
+    }
+
+    private fun createIncompatibleRegistry(path: String) {
+        val conn = DriverManager.getConnection("jdbc:sqlite:$path")
+        conn.createStatement().use { stmt ->
+            stmt.executeUpdate("""
+                CREATE TABLE content_locations (
+                    cid TEXT NOT NULL,
+                    machine_name TEXT NOT NULL,
+                    file_path TEXT NOT NULL,
+                    file_size INTEGER
+                )
+            """)
+        }
+        conn.close()
+    }
+
     data class RegistryTestEntry(
         val cid: String,
         val machine: String,
@@ -113,6 +161,118 @@ class CatalogIndexRegistryTest {
         assertEquals(1, results.size)
         assertEquals("Aliens.mkv", results[0].filename)
 
+        conn.close()
+    }
+
+    @Test
+    fun `rebuildFromRegistry accepts Sietch schema without last synced column`() {
+        val registryPath = tempDir.resolve("sietch-registry.db").toString()
+        val indexPath = tempDir.resolve("index.db").toString()
+        val registeredAt = "2026-07-31 12:34:56"
+        createSietchRegistry(registryPath, listOf(
+            TimestampedRegistryEntry(
+                cid = "bafkrei-synthetic-content",
+                machine = "server-a",
+                filePath = "/Volumes/archive/projects/notes.txt",
+                fileSize = 2048,
+                registeredAt = registeredAt
+            )
+        ))
+
+        val index = CatalogIndex(indexPath)
+        val conn = index.open()
+        val count = index.rebuildFromRegistry(conn, registryPath, emptyMap())
+
+        assertEquals(1, count)
+        val results = index.search(conn, "notes", 10)
+        assertEquals(1, results.size)
+        assertEquals("bafkrei-synthetic-content", results.single().cid)
+
+        val rs = conn.createStatement().executeQuery(
+            "SELECT last_synced_at FROM files WHERE cid = 'bafkrei-synthetic-content'"
+        )
+        assertTrue(rs.next())
+        assertEquals(registeredAt, rs.getString("last_synced_at"))
+        rs.close()
+        conn.close()
+    }
+
+    @Test
+    fun `rebuildFromRegistry clears stale projection for an empty Sietch snapshot`() {
+        val populatedRegistryPath = tempDir.resolve("unified.db").toString()
+        val emptySietchRegistryPath = tempDir.resolve("empty-sietch-registry.db").toString()
+        val indexPath = tempDir.resolve("index.db").toString()
+        createUnifiedRegistry(populatedRegistryPath, listOf(
+            RegistryTestEntry("bafkrei-stale", "server-a", "/Volumes/archive/stale.txt", 1024)
+        ))
+        createSietchRegistry(emptySietchRegistryPath, emptyList())
+
+        val index = CatalogIndex(indexPath)
+        val conn = index.open()
+        assertEquals(1, index.rebuildFromRegistry(conn, populatedRegistryPath, emptyMap()))
+        assertEquals(1, index.search(conn, "stale", 10).size)
+
+        val count = index.rebuildFromRegistry(conn, emptySietchRegistryPath, emptyMap())
+
+        assertEquals(0, count)
+        assertTrue(index.search(conn, "stale", 10).isEmpty())
+        assertEquals(0, index.stats(conn).totalFiles)
+        conn.close()
+    }
+
+    @Test
+    fun `rebuildFromRegistry preserves prior projection when registry is incompatible`() {
+        val populatedRegistryPath = tempDir.resolve("unified.db").toString()
+        val incompatibleRegistryPath = tempDir.resolve("incompatible-registry.db").toString()
+        val indexPath = tempDir.resolve("index.db").toString()
+        createUnifiedRegistry(populatedRegistryPath, listOf(
+            RegistryTestEntry("bafkrei-retained", "server-a", "/Volumes/archive/retained.txt", 1024)
+        ))
+        createIncompatibleRegistry(incompatibleRegistryPath)
+
+        val index = CatalogIndex(indexPath)
+        val conn = index.open()
+        assertEquals(1, index.rebuildFromRegistry(conn, populatedRegistryPath, emptyMap()))
+
+        assertFailsWith<IllegalArgumentException> {
+            index.rebuildFromRegistry(conn, incompatibleRegistryPath, emptyMap())
+        }
+
+        assertEquals(1, index.search(conn, "retained", 10).size)
+        assertEquals(1, index.stats(conn).totalFiles)
+        conn.close()
+    }
+
+    @Test
+    fun `rebuildFromRegistry does not roll back caller transaction when begin fails`() {
+        val registryPath = tempDir.resolve("sietch-registry.db").toString()
+        val indexPath = tempDir.resolve("index.db").toString()
+        createSietchRegistry(registryPath, emptyList())
+
+        val index = CatalogIndex(indexPath)
+        val conn = index.open()
+        conn.createStatement().use { stmt ->
+            stmt.executeUpdate("BEGIN")
+            stmt.executeUpdate(
+                "INSERT INTO catalog_sources " +
+                    "(drive_label, machine, root_path, catalog_date, hash_algorithm) " +
+                    "VALUES ('outer-drive', 'workstation', '/archive', '2026-07-31', 'synthetic')"
+            )
+        }
+
+        assertFailsWith<Exception> {
+            index.rebuildFromRegistry(conn, registryPath, emptyMap())
+        }
+
+        conn.createStatement().use { stmt ->
+            stmt.executeQuery(
+                "SELECT COUNT(*) FROM catalog_sources WHERE drive_label = 'outer-drive'"
+            ).use { rs ->
+                assertTrue(rs.next())
+                assertEquals(1, rs.getInt(1))
+            }
+            stmt.executeUpdate("ROLLBACK")
+        }
         conn.close()
     }
 
