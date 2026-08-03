@@ -15,7 +15,7 @@ cat > "$HOME_DIR/.config/choam/autodrain-ssh-keys" <<'EOF'
 EOF
 
 cat > "$TMP/darkmesh-status.json" <<'JSON'
-{"verdict":"GO","tailscale_ok":true,"pf":{"pf_kill_active":false}}
+{"verdict":"DEGRADED","desired":"off","tailscale_ok":true,"pf":{"pf_kill_active":true}}
 JSON
 
 cat > "$HOME_DIR/bin/networksetup" <<'SH'
@@ -82,6 +82,29 @@ assert data["state"] == "idle"
 assert data["detail"] == "drain completed"
 PY
 
+# ExpressVPN and the PF gate protect a separate public-network transfer client.
+# Their down/active state must not block CHOAM while its private mesh is healthy.
+[[ "$(wc -l < "$TMP/choam-calls" | tr -d ' ')" == 1 ]] \
+  || { echo "FAIL: VPN-off private-mesh transfer did not launch exactly once" >&2; exit 1; }
+
+# Tailscale remains fail-closed. An unavailable private mesh must not launch CHOAM.
+cat > "$TMP/darkmesh-status.json" <<'JSON'
+{"verdict":"GO","tailscale_ok":false,"pf":{"pf_kill_active":false}}
+JSON
+run_guard
+[[ "$(wc -l < "$TMP/choam-calls" | tr -d ' ')" == 1 ]] \
+  || { echo "FAIL: unavailable Tailscale launched CHOAM" >&2; exit 1; }
+/usr/bin/python3 - "$HOME_DIR/.local/state/choam-autodrain/status.json" <<'PY'
+import json, sys
+data = json.load(open(sys.argv[1]))
+assert data["state"] == "blocked"
+assert data["detail"] == "tailscale=false"
+PY
+
+cat > "$TMP/darkmesh-status.json" <<'JSON'
+{"verdict":"DEGRADED","desired":"off","tailscale_ok":true,"pf":{"pf_kill_active":true}}
+JSON
+
 set +e
 HOME="$HOME_DIR" \
   CHOAM="$HOME_DIR/bin/choam" \
@@ -105,4 +128,4 @@ assert data["state"] == "blocked"
 assert data["detail"] == "drain exited rc=7"
 PY
 
-echo "PASS: autodrain gates, success, and failure status"
+echo "PASS: autodrain private-mesh gates, VPN independence, success, and failure status"

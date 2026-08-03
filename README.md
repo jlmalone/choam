@@ -39,7 +39,7 @@ Built for the scenario where you have terabytes of media spread across a desktop
 - **Full CID display** — search results show complete IPFS CIDs + gateway URLs everywhere (CLI and web)
 - **Media browser** — browse and stream media files with content-type filtering, IPFS links, and play buttons
 - **Health report** — 10-section dashboard with coverage, replication, copy distribution, risk, staleness, transfer speeds, geo diversity, content classes, dedup, and recommendations
-- **Auto-drain (contrib)**: green-gated queue drainer in [`contrib/autodrain`](contrib/autodrain/) that runs `choam queue --run` on a schedule, but only when the machine is healthy (darkmesh GO + Tailscale up) and not on a phone hotspot
+- **Auto-drain (contrib)**: private-route queue drainer in [`contrib/autodrain`](contrib/autodrain/) that runs `choam queue --run` on a schedule when Tailscale is available and the machine is not on a phone hotspot; ExpressVPN is optional for these SSH transfers
 
 ## Install
 

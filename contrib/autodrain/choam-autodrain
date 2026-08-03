@@ -4,9 +4,8 @@
 #
 # Gates (all must hold):
 #   1. Not already draining          (choam's own PID run-lock, cheap, no JVM)
-#   2. darkmesh verdict == GO         (/tmp/darkmesh-status.json)
-#      AND tailscale_ok == true       (choam's destination path is reachable)
-#      AND pf_kill_active == false    (network is "safe", not VPN-down/hotspot)
+#   2. tailscale_ok == true           (/tmp/darkmesh-status.json)
+#                                      (private mesh is available)
 #   3. NOT on a hotspot SSID          (same list vpn-guard uses; never burn cellular)
 #   4. Queue has PENDING/FAILED work  AND nothing RUNNING (SQLite, cheap, no JVM)
 #
@@ -20,8 +19,8 @@
 # internal run-lock remains the final backstop against manual/concurrent drains.
 #
 # Overrides (env): CHOAM, CHOAM_HOME, DARKMESH_STATUS, HOTSPOT_PATTERNS_FILE,
-# CHOAM_AUTODRAIN_INTERVAL, CHOAM_AUTODRAIN_REQUIRE_GO, CHOAM_MAX_RETRIES,
-# CHOAM_AUTODRAIN_SSH_KEY_FILE.
+# CHOAM_AUTODRAIN_INTERVAL, CHOAM_AUTODRAIN_REQUIRE_TAILSCALE,
+# CHOAM_MAX_RETRIES, CHOAM_AUTODRAIN_SSH_KEY_FILE.
 
 set -uo pipefail
 
@@ -32,7 +31,10 @@ RUN_LOCK="$CHOAM_HOME/queue-run.lock"
 DARKMESH_STATUS="${DARKMESH_STATUS:-/tmp/darkmesh-status.json}"
 HOTSPOT_FILE="${HOTSPOT_PATTERNS_FILE:-$HOME/.config/vpn-guard/hotspot-ssids.txt}"
 MIN_INTERVAL="${CHOAM_AUTODRAIN_INTERVAL:-90}"
-REQUIRE_GO="${CHOAM_AUTODRAIN_REQUIRE_GO:-1}"
+# Keep the old override as a compatibility alias. Its meaning is narrowed to the
+# private-mesh availability gate; ExpressVPN state and its public-client PF gate
+# never authorize CHOAM's independently encrypted SSH routes.
+REQUIRE_TAILSCALE="${CHOAM_AUTODRAIN_REQUIRE_TAILSCALE:-${CHOAM_AUTODRAIN_REQUIRE_GO:-1}}"
 MAX_RETRIES="${CHOAM_MAX_RETRIES:-5}"
 SSH_KEY_FILE="${CHOAM_AUTODRAIN_SSH_KEY_FILE:-$HOME/.config/choam/autodrain-ssh-keys}"
 
@@ -90,26 +92,23 @@ if [[ -f "$RUN_LOCK" ]]; then
   fi
 fi
 
-# --- 3) darkmesh gate: GO + tailscale up + not fail-closed ---------------------
-if [[ "$REQUIRE_GO" == 1 ]]; then
+# --- 3) private-mesh gate: Tailscale up; ExpressVPN is optional ----------------
+if [[ "$REQUIRE_TAILSCALE" == 1 ]]; then
   if [[ ! -r "$DARKMESH_STATUS" ]]; then
     write_status blocked "no darkmesh status"; log "blocked: no $DARKMESH_STATUS"; exit 0
   fi
-  read -r verdict tailscale pfkill < <("$PY" - "$DARKMESH_STATUS" <<'PY' 2>/dev/null || true
+  tailscale="$("$PY" - "$DARKMESH_STATUS" <<'PY' 2>/dev/null || true
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
 except Exception:
-    print("ERR true true"); sys.exit(0)
-pf = d.get("pf") or {}
-print(d.get("verdict", "?"),
-      str(d.get("tailscale_ok", False)).lower(),
-      str(pf.get("pf_kill_active", False)).lower())
+    print("false"); sys.exit(0)
+print(str(d.get("tailscale_ok", False)).lower())
 PY
-)
-  if [[ "$verdict" != "GO" || "$tailscale" != "true" || "$pfkill" == "true" ]]; then
-    write_status blocked "verdict=$verdict tailscale=$tailscale pfkill=$pfkill"
-    log "blocked: verdict=$verdict tailscale=$tailscale pfkill=$pfkill"; exit 0
+  )"
+  if [[ "$tailscale" != "true" ]]; then
+    write_status blocked "tailscale=$tailscale"
+    log "blocked: tailscale=$tailscale"; exit 0
   fi
 fi
 
@@ -180,7 +179,7 @@ if [[ -r "$SSH_KEY_FILE" ]]; then
   done < "$SSH_KEY_FILE"
 fi
 
-log "actuating: $candidates eligible, verdict=GO, ssid='${ssid:-}' -> choam queue --run"
+log "actuating: $candidates eligible, tailscale=ready, expressvpn=optional, ssid='${ssid:-}' -> choam queue --run"
 write_status draining "started drain: $candidates pending"
 # Bound the drain log: a flaky remote can make choam spew hundreds of MB of
 # "unreachable -- will retry later". Rotate at ~5MB, keep one previous file.

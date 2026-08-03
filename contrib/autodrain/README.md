@@ -14,14 +14,16 @@ class of stall on a schedule.
 
 1. **Not already draining.** Reads choam's own run-lock (`~/.choam/queue-run.lock`,
    holds the live PID). Cheap, no JVM.
-2. **Machine green.** `/tmp/darkmesh-status.json` reports `verdict == "GO"`,
-   `tailscale_ok == true` (choam's destination is reachable), and
-   `pf_kill_active == false` (network is "safe", i.e. not VPN-down / hotspot).
+2. **Private mesh available.** `/tmp/darkmesh-status.json` reports
+   `tailscale_ok == true`. ExpressVPN is optional for CHOAM: its verdict and the
+   PF gate for a separate public-network transfer client do not authorize
+   CHOAM's SSH routes.
 3. **Not on a hotspot.** The current Wi-Fi SSID is not in
    `~/.config/vpn-guard/hotspot-ssids.txt` (the same list vpn-guard uses). This
    is what stops the drain from burning cellular data on a phone hotspot.
-   choam runs over Tailscale/SSH, which the VPN kill-rules do NOT block, so
-   without this gate it would happily transfer over a hotspot.
+   CHOAM also performs an Apple Network-framework metered-link check before it
+   claims queue work. This catches Personal Hotspot links even when macOS hides
+   the SSID from the background process.
 4. **There is eligible work.** The queue has a `PENDING`/`FAILED` entry whose
    retry budget is not exhausted and whose backoff has elapsed, with nothing
    `RUNNING` (WAL-aware, query-only SQLite on `~/.choam/transfer_queue.db`; no JVM).
@@ -73,7 +75,8 @@ CHOAM_AUTODRAIN_INTERVAL=0 ~/.local/bin/choam-autodrain; cat ~/.local/state/choa
 | Var | Default | Meaning |
 |-----|---------|---------|
 | `CHOAM_AUTODRAIN_INTERVAL` | `90` | Min seconds between evaluations |
-| `CHOAM_AUTODRAIN_REQUIRE_GO` | `1` | Require darkmesh `verdict=GO` (set `0` to gate on hotspot + queue only) |
+| `CHOAM_AUTODRAIN_REQUIRE_TAILSCALE` | `1` | Require Darkmesh's Tailscale probe to pass (set `0` to gate on hotspot + queue only) |
+| `CHOAM_AUTODRAIN_REQUIRE_GO` | unset | Deprecated compatibility alias for `CHOAM_AUTODRAIN_REQUIRE_TAILSCALE` |
 | `CHOAM_MAX_RETRIES` | `5` | Maximum retry count eligible for automatic draining |
 | `CHOAM` | `/opt/homebrew/bin/choam` | choam binary |
 | `DARKMESH_STATUS` | `/tmp/darkmesh-status.json` | darkmesh status file |
@@ -89,5 +92,6 @@ lines and comments beginning with `#` are ignored.
 Like vpn-guard, the hotspot check matches the Wi-Fi SSID against a substring
 list; it does not otherwise detect a metered/cellular link. Keep the list
 current. Also note macOS only returns the SSID to a background process that has
-Location permission; if the SSID reads empty, the `pf_kill_active` gate (which
-vpn-guard sets when it detects a hotspot) is the backstop.
+Location permission. CHOAM's queue processor therefore checks Apple's
+`NWPath.isExpensive` signal before claiming any work; the SSID list remains an
+additional early gate.
