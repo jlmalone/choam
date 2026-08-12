@@ -6,7 +6,11 @@ import vision.salient.choam.config.ChoamConfig
 import vision.salient.choam.config.MachineProfile
 import vision.salient.choam.lowPriority
 import vision.salient.choam.network.*
+import vision.salient.choam.receipt.QueueReceiptStore
+import vision.salient.choam.receipt.TransferReceiptState
+import vision.salient.choam.receipt.TransferRoute
 import java.io.File
+import java.security.MessageDigest
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.Paths
@@ -44,6 +48,25 @@ class QueueProcessor(
     private val rsyncEngine = RsyncTransferEngine()
     private val historyStore = SyncHistoryStore()
     private val networkDetector = NetworkDetector()
+    private val receiptStore = QueueReceiptStore(queue.receiptDatabasePath)
+
+    private fun receiptRoute(entry: TransferQueueEntry, route: NetworkRoute): TransferRoute {
+        // Deliberately fingerprint only an opaque queue ID, retry generation, and route mode.
+        // NetworkRoute addresses, machine names, and endpoint details never enter receipt storage.
+        val material = "${entry.id}:${entry.retryCount}:${route.mode.name}".toByteArray()
+        val digest = MessageDigest.getInstance("SHA-256").digest(material)
+            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
+        return TransferRoute(entry.retryCount.toLong(), "route-$digest")
+    }
+
+    private fun admitReceipt(entry: TransferQueueEntry, source: File, route: NetworkRoute): Boolean {
+        val expectedFiles = if (source.isDirectory) source.walkTopDown().count { it.isFile }.toLong() else 1L
+        val expectedBytes = if (source.isDirectory) source.walkTopDown().filter { it.isFile }.sumOf { it.length() } else source.length()
+        return receiptStore.admit(entry.id, expectedBytes, expectedFiles, receiptRoute(entry, route)) is QueueReceiptStore.MutationResult.Applied
+    }
+
+    private fun observeReceipt(entry: TransferQueueEntry, state: TransferReceiptState, failureCode: String? = null, processExitCode: Int? = null): Boolean =
+        receiptStore.observe(entry.id, state, failureCode, processExitCode) is QueueReceiptStore.MutationResult.Applied
 
     /**
      * Process all pending queue entries.
@@ -118,6 +141,8 @@ class QueueProcessor(
      * starving the rest of the queue.
      */
     private fun failWithBackoff(entry: TransferQueueEntry, message: String, bytes: Long? = null) {
+        // Error detail remains exclusively in the legacy queue. Receipts get a fixed code only.
+        observeReceipt(entry, TransferReceiptState.FAILED, failureCode = "PROCESSING_FAILED")
         val newRetryCount = entry.retryCount + 1
         val exhausted = newRetryCount > TransferQueueEntry.MAX_RETRIES
         val nextRetry = if (exhausted) null else TransferQueueEntry.nextBackoff(newRetryCount)
@@ -179,9 +204,14 @@ class QueueProcessor(
         }
 
         val route = networkDetector.detectBestRoute(localMachine, remoteMachine)
+        if (!admitReceipt(entry, srcFile, route)) {
+            failWithBackoff(entry, "Receipt admission unavailable")
+            return SingleResult.FAILED
+        }
         val connectivity = networkDetector.testConnectivity(route)
         if (!connectivity.reachable) {
             echo("  ${entry.id}: ${remoteMachine.name} unreachable — will retry later")
+            observeReceipt(entry, TransferReceiptState.DEFERRED, failureCode = "NETWORK_DEFERRED")
             queue.defer(entry.id, "${remoteMachine.name} unreachable")
             return SingleResult.DEFERRED
         }
@@ -236,6 +266,12 @@ class QueueProcessor(
         val srcFile = File(entry.sourcePath)
         val effectiveBwLimit = bandwidthOverride ?: entry.bandwidthLimitKBps
 
+        // This is the first point at which source ownership is guarded.
+        if (!observeReceipt(entry, TransferReceiptState.ACTIVE)) {
+            failWithBackoff(entry, "Receipt activation unavailable")
+            return SingleResult.FAILED
+        }
+
         // ── PRE-FLIGHT SAFETY CHECK ──
         val preflightOutcome = SendPreflight.checkRemoteFiles(
             listOf(entry.sourcePath), entry.destinationPath, remoteMachine, route
@@ -252,6 +288,7 @@ class QueueProcessor(
             is PreflightOutcome.FallThrough -> {
                 // SSH unreachable for pre-flight — defer rather than proceeding blind
                 echo("  ${entry.id}: pre-flight SSH unreachable — deferring")
+                observeReceipt(entry, TransferReceiptState.DEFERRED, failureCode = "NETWORK_DEFERRED")
                 queue.defer(entry.id, "pre-flight SSH unreachable")
                 return SingleResult.DEFERRED
             }
@@ -517,6 +554,15 @@ class QueueProcessor(
             is TransferResult.Success -> {
                 val bytes = result.bytesTransferred.coerceAtLeast(srcFile.length())
 
+                // A zero rsync exit only begins local verification. It is never destination
+                // evidence, a destination commit, or a completed delivery assertion.
+                if (!observeReceipt(entry, TransferReceiptState.VERIFYING_BYTES, processExitCode = 0) ||
+                    !observeReceipt(entry, TransferReceiptState.VERIFYING_FILES, processExitCode = 0)
+                ) {
+                    failWithBackoff(entry, "Receipt verification observation unavailable", bytes)
+                    return SingleResult.FAILED
+                }
+
                 // ── SOURCE GUARD: post-transfer verification ──
                 val sourceCheck = guard.verifySourceUnchanged()
                 if (!sourceCheck.passed) {
@@ -691,6 +737,8 @@ class QueueProcessor(
                 }
 
                 echo("  ${entry.id}: ${result.message}$suffix")
+
+                observeReceipt(entry, TransferReceiptState.FAILED, failureCode = "TRANSFER_FAILED")
 
                 queue.update(entry.id) {
                     it.copy(

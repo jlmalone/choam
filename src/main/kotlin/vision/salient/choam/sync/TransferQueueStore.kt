@@ -3,6 +3,8 @@ package vision.salient.choam.sync
 import kotlinx.serialization.builtins.ListSerializer
 import kotlinx.serialization.json.Json
 import mu.KotlinLogging
+import vision.salient.choam.receipt.QueueReceiptStore
+import vision.salient.choam.receipt.TransferReceiptState
 import java.io.File
 import java.nio.file.Files
 import java.nio.file.Path
@@ -30,6 +32,9 @@ class TransferQueueStore(
         System.getProperty("user.home"), ".choam", "transfer_queue.db"
     )
 ) {
+    /** The private receipt table shares this SQLite database but not the queue-status schema. */
+    val receiptDatabasePath: Path get() = dbPath
+    private val receiptStore by lazy { QueueReceiptStore(dbPath) }
     // Progress sidecars live alongside the queue DB. In production dbPath is
     // ~/.choam/transfer_queue.db so this is ~/.choam (unchanged); deriving it from dbPath
     // instead of hardcoding $HOME keeps the watchdog's progress-staleness check correct
@@ -575,7 +580,11 @@ class TransferQueueStore(
                 ps.executeUpdate() > 0
             }
         }
-        if (cancelled) publishStatusSnapshot()
+        if (cancelled) {
+            // Queue data remains the legacy authority. Receipt detail is deliberately generic.
+            receiptStore.observe(id, TransferReceiptState.CANCELLED)
+            publishStatusSnapshot()
+        }
         return cancelled
     }
 
@@ -610,7 +619,10 @@ class TransferQueueStore(
             }
         }
         if (deferToNonRunningCancel) return cancel(id)
-        if (cancelled) publishStatusSnapshot()
+        if (cancelled) {
+            receiptStore.observe(id, TransferReceiptState.CANCELLED)
+            publishStatusSnapshot()
+        }
         return cancelled
     }
 

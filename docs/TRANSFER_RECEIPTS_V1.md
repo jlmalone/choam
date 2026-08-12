@@ -47,3 +47,24 @@ always replaced with `LEGACY_FAILURE_DETAIL_REDACTED`.
 The later live integration must write receipt observations separately from the legacy queue, retain
 the observation watermark/IDs durably, obtain a real destination proof, and inject the verifier at
 the trusted Manager boundary.
+
+## Queue producer tranche
+
+`QueueReceiptStore` keeps private `queue_transfer_receipts` rows in the existing queue SQLite
+database. Each row contains the complete V1 receipt JSON; replacement of that JSON, its bounded
+applied-observation IDs, and its sequence watermark occurs in one SQLite transaction. Malformed
+rows are never replaced or reopened. Queue clearing and normal queue expiry only remove legacy
+queue rows, never receipt rows.
+
+`QueueProcessor` admits a receipt only once local byte/file expectations are available, marks it
+`ACTIVE` only after `SourceGuard` ownership is acquired, and emits fixed-code `DEFERRED`, `FAILED`,
+or `CANCELLED` facts. No path, account, host, endpoint, route address, queue error, or process
+output is placed in a receipt. Route fingerprints are opaque local hashes; retry/reopen creates a
+new attempt and clears evidence. An rsync exit of zero progresses only through
+`VERIFYING_BYTES` and `VERIFYING_FILES`; this tranche never writes destination evidence,
+`DESTINATION_COMMITTED`, or `COMPLETED`.
+
+Receipt and legacy queue updates currently use separate transactions on the same database. This is
+intentional: the established queue mutations and schema-1 status snapshot remain untouched. A
+future integration may introduce a single cross-table queue-state/receipt transaction only after
+its queue lifecycle ownership is widened and reviewed; callers must not infer that it exists now.
