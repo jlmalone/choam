@@ -1,0 +1,1 @@
+{"schema":1,"generatedAt":"2026-08-12T00:00:00Z","queue":[{"id":"queue-001","source":"/neutral/source.bin","dest":"destination-label:/neutral/destination.bin","status":"completed"},{"id":"queue-002","source":"/neutral/source.bin","dest":"destination-label:/neutral/destination.bin","status":"failed","error":"/private/host/path"}],"summary":{"running":0,"pending":0,"failed":1}}
