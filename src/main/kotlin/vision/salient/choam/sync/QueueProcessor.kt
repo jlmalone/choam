@@ -12,10 +12,8 @@ import vision.salient.choam.receipt.TransferRoute
 import java.io.File
 import java.security.MessageDigest
 import java.nio.file.Files
-import java.nio.file.FileVisitResult
 import java.nio.file.Path
 import java.nio.file.Paths
-import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
 import java.time.Duration
 import java.time.Instant
@@ -34,6 +32,10 @@ data class ProcessingResult(
     val failed: Int,
     val deferred: Int
 )
+
+/** Receipt-only state for an already-present legacy success. */
+internal fun alreadyPresentReceiptState(authoritativeComparison: Boolean): TransferReceiptState =
+    if (authoritativeComparison) TransferReceiptState.VERIFYING_FILES else TransferReceiptState.DEFERRED
 
 /**
  * Unified queue processor used by CLI, daemon, and web.
@@ -63,34 +65,18 @@ class QueueProcessor(
     }
 
     /**
-     * Receipt expectations are a guarded, single-pass snapshot.  A changing or unreadable tree
-     * simply has no receipt in this tranche; it is never a reason to alter legacy processing.
+     * Only a regular file has a local expectation trusted by this tranche. New directory
+     * receipts are deliberately ineligible: root metadata cannot prove a tree was stable.
+     * Existing durable expectations remain reusable without walking the source again.
      */
     private fun receiptExpectations(entry: TransferQueueEntry, source: File): QueueReceiptStore.Expectations? {
         receiptStore.reusableExpectations(entry.id)?.let { return it }
         return try {
-            if (!source.isDirectory) {
+            if (source.isDirectory) {
+                null
+            } else {
                 val size = Files.readAttributes(source.toPath(), BasicFileAttributes::class.java).size()
                 QueueReceiptStore.Expectations(size, 1)
-            } else {
-                val root = Files.readAttributes(source.toPath(), BasicFileAttributes::class.java)
-                var files = 0L
-                var bytes = 0L
-                Files.walkFileTree(source.toPath(), object : SimpleFileVisitor<Path>() {
-                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
-                        if (attrs.isRegularFile && !isExcludedFromTree(file.fileName.toString())) {
-                            files = Math.addExact(files, 1L)
-                            bytes = Math.addExact(bytes, attrs.size())
-                        }
-                        return FileVisitResult.CONTINUE
-                    }
-
-                    override fun visitFileFailed(file: Path, exc: java.io.IOException): FileVisitResult =
-                        throw exc
-                })
-                val after = Files.readAttributes(source.toPath(), BasicFileAttributes::class.java)
-                if (root.size() != after.size() || root.lastModifiedTime() != after.lastModifiedTime()) null
-                else QueueReceiptStore.Expectations(bytes, files)
             }
         } catch (_: Exception) {
             null
@@ -367,6 +353,12 @@ class QueueProcessor(
                 }
 
                 if (preflight.identicalFiles.isNotEmpty() && preflight.newFiles.isEmpty() && preflight.conflictFiles.isEmpty()) {
+                    val metadataOnly = preflight.identicalFiles.filter { manifest ->
+                        manifest.localChecksum == null || manifest.remoteChecksum == null ||
+                            manifest.localChecksum != manifest.remoteChecksum ||
+                            manifest.localSize != manifest.remoteSize
+                    }
+                    var authoritativeComparison = metadataOnly.isEmpty()
                     // Already at destination — for MOVE, verify full integrity then delete source
                     if (entry.mode == TransferMode.MOVE) {
                         // ── SOURCE GUARD: verify source unchanged since guard acquisition ──
@@ -390,13 +382,7 @@ class QueueProcessor(
 
                         val totalFiles = preflight.identicalFiles.size
 
-                        val unverified = preflight.identicalFiles.filter { manifest ->
-                            manifest.localChecksum == null || manifest.remoteChecksum == null ||
-                                manifest.localChecksum != manifest.remoteChecksum ||
-                                manifest.localSize != manifest.remoteSize
-                        }
-
-                        if (unverified.isNotEmpty()) {
+                        if (metadataOnly.isNotEmpty()) {
                             // Preflight lacked content-hash PROOF for some files — e.g. a mixed
                             // tree-diff bucketed unchanged files with null checksums, or the remote
                             // manifest was metadata-only (contentHash: null). That is "unproven", NOT
@@ -416,11 +402,12 @@ class QueueProcessor(
                                 PostTransferVerifier.verifySingleFile(srcFile, entry.destinationPath, remoteMachine, route)
                             }
                             if (!authoritative) {
-                                echo("  ${entry.id}: ${unverified.size}/$totalFiles file(s) not confirmed byte-identical at destination — source kept")
+                                echo("  ${entry.id}: ${metadataOnly.size}/$totalFiles file(s) not confirmed byte-identical at destination — source kept")
                                 failWithBackoff(entry,
-                                    "Move aborted: destination copy not confirmed byte-identical (${unverified.size}/$totalFiles file(s) unproven)")
+                                    "Move aborted: destination copy not confirmed byte-identical (${metadataOnly.size}/$totalFiles file(s) unproven)")
                                 return SingleResult.FAILED
                             }
+                            authoritativeComparison = true
                             echo("  ${entry.id}: $totalFiles file(s) authoritatively verified by SHA-256 at destination")
                         }
 
@@ -484,10 +471,15 @@ class QueueProcessor(
                             )
                         }
                     }
-                    // The local comparison above is authoritative for this legacy success path.
-                    // It may describe verification, but never destination commit or delivery.
-                    observeReceipt(receiptAdmitted, entry, TransferReceiptState.VERIFYING_BYTES, processExitCode = 0)
-                    observeReceipt(receiptAdmitted, entry, TransferReceiptState.VERIFYING_FILES, processExitCode = 0)
+                    // Only matching checksums or an authoritative hash comparison can enter
+                    // verification. A metadata-only COPY remains a legacy success, while its
+                    // receipt is explicitly deferred until authoritative verification exists.
+                    if (authoritativeComparison) {
+                        observeReceipt(receiptAdmitted, entry, TransferReceiptState.VERIFYING_BYTES, processExitCode = 0)
+                        observeReceipt(receiptAdmitted, entry, alreadyPresentReceiptState(true), processExitCode = 0)
+                    } else {
+                        observeReceipt(receiptAdmitted, entry, alreadyPresentReceiptState(false), failureCode = "AUTHORITATIVE_VERIFICATION_REQUIRED")
+                    }
                     queue.update(entry.id) {
                         it.copy(status = TransferStatus.COMPLETED, completedAt = Instant.now().toString(), error = null)
                     }

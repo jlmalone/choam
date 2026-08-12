@@ -115,4 +115,23 @@ class QueueReceiptStoreTest {
             locked.createStatement().use { it.execute("ROLLBACK") }
         }
     }
+
+    @Test fun `stale optimistic CAS is unavailable and cannot replace a concurrent receipt`() {
+        val db = Files.createTempDirectory("receipt-store-cas").resolve("queue.db")
+        val first = QueueReceiptStore(db)
+        val second = QueueReceiptStore(db)
+        first.admit("queue-010", 12, 1, route)
+        first.beforeCompareAndSwapForTest = {
+            first.beforeCompareAndSwapForTest = null
+            assertIs<QueueReceiptStore.MutationResult.Applied>(
+                second.observe("queue-010", TransferReceiptState.ACTIVE)
+            )
+        }
+
+        assertIs<QueueReceiptStore.MutationResult.Unavailable>(
+            first.observe("queue-010", TransferReceiptState.DEFERRED, "NETWORK_DEFERRED")
+        )
+        val persisted = assertIs<QueueReceiptStore.ReadResult.Present>(first.load("queue-010")).receipt
+        assertEquals(TransferReceiptState.ACTIVE, persisted.state)
+    }
 }

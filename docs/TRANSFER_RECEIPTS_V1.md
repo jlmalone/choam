@@ -51,10 +51,12 @@ the trusted Manager boundary.
 ## Queue producer tranche
 
 `QueueReceiptStore` keeps private `queue_transfer_receipts` rows in the existing queue SQLite
-database. Each row contains the complete V1 receipt JSON; replacement of that JSON, its bounded
-applied-observation IDs, and its sequence watermark occurs in one SQLite transaction. Malformed
-rows are never replaced or reopened. Queue clearing and normal queue expiry only remove legacy
-queue rows, never receipt rows.
+database. Each row contains the complete V1 receipt JSON plus a private version. A zero-wait,
+optimistic compare-and-swap replaces the complete JSON (including its bounded applied-observation
+IDs and sequence watermark) in one statement. Reads and reduction happen before that minimal
+write lock; a concurrent change or lock contention is only sanitized receipt-unavailable, never a
+legacy queue write dependency. Malformed rows are never replaced or reopened. Queue clearing and
+normal queue expiry only remove legacy queue rows, never receipt rows.
 
 `QueueProcessor` admits a receipt only once local byte/file expectations are available, marks it
 `ACTIVE` only after `SourceGuard` ownership is acquired, and emits fixed-code `DEFERRED`, `FAILED`,
@@ -70,15 +72,18 @@ receipt-unavailable condition; they never fail, defer, retry, cancel, or otherwi
 queue processing. No observation is claimed when it was not durably stored. Terminal receipt rows
 remain fail-closed. When a legacy reset or stale-running recovery makes an `ACTIVE` or verifying
 receipt claimable again, the producer first durably records `STALE_ATTEMPT_RECONCILED` as a
-deferred old attempt and then creates a fresh attempt/route; this does not consume a legacy retry.
+deferred old attempt and then creates a fresh attempt/route. Receipt reconciliation adds no
+additional retry solely because of receipt state; the established legacy stale-running recovery
+may apply its own retry policy unchanged.
 
-For directory sources the producer captures expected files and bytes in one guarded traversal,
-using checked arithmetic and treating unreadable or changing trees as receipt-ineligible while the
-legacy transfer continues. A valid current receipt reuses its durable expectations on retry.
-The already-present-at-destination legacy success path records no state past `VERIFYING_FILES`,
-and does so only after its authoritative local comparison. Receipt gaps are therefore expected
-whenever this optional side channel is unavailable or expectations cannot safely be established;
-they are not evidence of a missing legacy transfer outcome.
+For directory sources this tranche creates no new receipt: root metadata cannot establish that a
+tree is stable. A valid current receipt may reuse its durable expectations on retry, while legacy
+directory transfers continue unchanged. The already-present-at-destination legacy success path
+records `VERIFYING_BYTES` and `VERIFYING_FILES` only after matching checksums or an authoritative
+hash comparison. A metadata-only COPY remains a legacy success but records sanitized `DEFERRED`
+with `AUTHORITATIVE_VERIFICATION_REQUIRED`, never verification. Receipt gaps are therefore
+expected whenever this optional side channel is unavailable or expectations cannot safely be
+established; they are not evidence of a missing legacy transfer outcome.
 
 Receipt and legacy queue updates currently use separate transactions on the same database. This is
 intentional: the established queue mutations and schema-1 status snapshot remain untouched. A
