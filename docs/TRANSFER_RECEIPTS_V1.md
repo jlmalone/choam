@@ -15,11 +15,15 @@ completion, failure, cancellation, and the latest observation. Observations must
 receipt persists a bounded immutable recent-ID list plus sequence watermark: writers must persist
 both atomically with the receipt or duplicate suppression is not durable across a crash.
 
-Completion requires a destination-authoritative proof and a caller-supplied
+Completion requires a coherent `DESTINATION_COMMITTED` lineage: admission, start, verification,
+destination-commit, completion, and last-observed timestamps must all be present and monotonic.
+Completion also requires a destination-authoritative proof and a caller-supplied
 `DestinationEvidenceVerifier`. The proof declares a supported V1 scheme, destination authority-key
-fingerprint, and either a canonical receipt SHA-256 digest/signature or a local authoritative-probe
-attestation. The default Manager decoder supplies no verifier and therefore never reports delivery.
-Only a verifier that authenticates the proof can permit `COMPLETED`.
+fingerprint, transfer ID, attempt ID, route generation/fingerprint, and either a canonical receipt
+SHA-256 digest/signature or a local authoritative-probe attestation. The verifier must
+cryptographically authenticate those binding fields as part of the proof; matching fields alone are
+not authoritative. The default Manager decoder supplies no verifier and therefore never reports
+delivery. Only a verifier that authenticates the proof can permit `COMPLETED`.
 
 At least one content expectation (bytes, files, or hash) is required. Declared and observed hashes
 currently support only exact canonical `SHA-256` lowercase hexadecimal values. Counts and route
@@ -28,6 +32,8 @@ and invalid identifiers are rejected.
 
 Restarting is allowed only from `DEFERRED` or `FAILED`. It returns a new receipt value with a new
 attempt ID and retains a durable summary of the former attempt; the prior receipt is unchanged.
+An allowed route change is only a transition to `DEFERRED`; it clears destination evidence so that
+evidence from the old route cannot be reused.
 
 ## Manager decode seam
 

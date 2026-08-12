@@ -35,12 +35,16 @@ data class DestinationEvidenceProof(
     val scheme: DestinationEvidenceProofScheme,
     val version: Int = 1,
     val destinationAuthorityKeyFingerprint: String,
+    val transferId: String,
+    val attemptId: String,
+    val route: TransferRoute,
     val canonicalReceiptDigestSha256: String? = null,
     val signature: String? = null,
     val localAuthoritativeProbeAttestation: String? = null,
 ) {
     init {
         require(version == 1 && routeFingerprint.matches(destinationAuthorityKeyFingerprint))
+        require(opaqueId.matches(transferId) && opaqueId.matches(attemptId))
         require(canonicalReceiptDigestSha256 == null || sha256.matches(canonicalReceiptDigestSha256))
         when (scheme) {
             DestinationEvidenceProofScheme.LOCAL_AUTHORITATIVE_PROBE_V1 -> require(localAuthoritativeProbeAttestation?.matches(Regex("[A-Za-z0-9_-]{1,256}")) == true)
@@ -109,10 +113,15 @@ data class TransferReceiptV1(
     init {
         require(schema == TRANSFER_RECEIPT_SCHEMA_V1 && opaqueId.matches(transferId) && opaqueId.matches(attemptId))
         require(queueEntryId == null || opaqueId.matches(queueEntryId)); require(expectedBytes == null || expectedBytes >= 0); require(expectedFiles == null || expectedFiles >= 0)
+        require(expectedBytes != null || expectedFiles != null || declaredHashes.isNotEmpty()) { "at least one content expectation is required" }
         requireUniqueHashes(declaredHashes.map { it.algorithm to it.expected }); require(failureCode == null || failureCodePattern.matches(failureCode))
         require(appliedObservationIds.size <= MAX_APPLIED_OBSERVATIONS && appliedObservationIds.distinct().size == appliedObservationIds.size && appliedObservationIds.all(opaqueId::matches))
         require(lastAppliedObservationSequence in 0 until Long.MAX_VALUE)
+        require(destinationEvidence == null || hasCurrentBinding(destinationEvidence)) { "destination evidence binding does not match receipt" }
+        require(state != TransferReceiptState.COMPLETED || timestamps.hasCompletedLineage()) { "completed receipt lacks destination-committed lineage" }
     }
+
+    private fun hasCurrentBinding(evidence: DestinationEvidence) = evidence.proof.transferId == transferId && evidence.proof.attemptId == attemptId && evidence.proof.route == route
 }
 
 @Serializable
@@ -148,15 +157,16 @@ object TransferReceiptReducer {
         if (!allowed(receipt.state, observation.state)) return ReceiptApplyResult.Rejected("ILLEGAL_TRANSITION")
         if (observation.route != null && observation.route != receipt.route && observation.state != TransferReceiptState.DEFERRED) return ReceiptApplyResult.Rejected("ROUTE_CHANGE_REQUIRES_DEFERRED")
         if (observation.state == TransferReceiptState.FAILED && observation.failureCode == null) return ReceiptApplyResult.Rejected("MISSING_FAILURE_CODE")
-        val evidence = observation.destinationEvidence ?: receipt.destinationEvidence
+        val routeChanged = observation.route != null && observation.route != receipt.route
+        val evidence = if (routeChanged) null else observation.destinationEvidence ?: receipt.destinationEvidence
+        if (evidence != null && !hasCurrentBinding(receipt, evidence, observation.route ?: receipt.route)) return ReceiptApplyResult.Rejected("DESTINATION_EVIDENCE_BINDING_MISMATCH")
         if (observation.state == TransferReceiptState.COMPLETED && !isAuthoritativelyComplete(receipt, evidence, verifier)) return ReceiptApplyResult.Rejected("DESTINATION_EVIDENCE_REQUIRED")
         val timestamps = transitionTimes(receipt.timestamps, observation)
         return ReceiptApplyResult.Applied(receipt.copy(route = observation.route ?: receipt.route, destinationEvidence = evidence, timestamps = timestamps, state = observation.state, processExitCode = observation.processExitCode ?: receipt.processExitCode, failureCode = observation.failureCode ?: receipt.failureCode, appliedObservationIds = (receipt.appliedObservationIds + observation.observationId).takeLast(MAX_APPLIED_OBSERVATIONS), lastAppliedObservationSequence = observation.sequence))
     }
 
     fun isAuthoritativelyComplete(receipt: TransferReceiptV1, evidence: DestinationEvidence?, verifier: DestinationEvidenceVerifier?): Boolean {
-        if (evidence == null || verifier == null || evidence.authority != receipt.destinationAuthority || !verifier.verifies(receipt, evidence)) return false
-        if (receipt.expectedBytes == null && receipt.expectedFiles == null && receipt.declaredHashes.isEmpty()) return false
+        if (evidence == null || verifier == null || evidence.authority != receipt.destinationAuthority || !hasCurrentBinding(receipt, evidence, receipt.route) || !verifier.verifies(receipt, evidence)) return false
         if (receipt.expectedBytes != null && receipt.expectedBytes != evidence.observedBytes || receipt.expectedFiles != null && receipt.expectedFiles != evidence.observedFiles) return false
         return receipt.declaredHashes.all { declared -> evidence.observedHashes.any { it.algorithm == declared.algorithm && it.value == declared.expected } }
     }
@@ -181,5 +191,12 @@ object TransferReceiptReducer {
         TransferReceiptState.DESTINATION_COMMITTED -> to in setOf(TransferReceiptState.COMPLETED, TransferReceiptState.FAILED, TransferReceiptState.CANCELLED)
         TransferReceiptState.COMPLETED, TransferReceiptState.FAILED, TransferReceiptState.CANCELLED -> false
     }
+
+    private fun hasCurrentBinding(receipt: TransferReceiptV1, evidence: DestinationEvidence, route: TransferRoute) = evidence.proof.transferId == receipt.transferId && evidence.proof.attemptId == receipt.attemptId && evidence.proof.route == route
 }
 private fun requireUniqueHashes(values: List<Pair<String, String>>) { require(values.map { it.first }.distinct().size == values.size) { "duplicate hash algorithm" } }
+
+private fun TransferTimestamps.hasCompletedLineage(): Boolean {
+    val lineage = listOf(commandAcceptedAt, queueAdmittedAt, startedAt, verificationStartedAt, destinationCommittedAt, completedAt, lastObservedAt)
+    return lineage.all { it != null } && lineage.zipWithNext().all { (earlier, later) -> !earlier!!.isAfter(later!!) }
+}
