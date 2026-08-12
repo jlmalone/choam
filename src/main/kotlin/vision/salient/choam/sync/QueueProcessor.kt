@@ -12,8 +12,11 @@ import vision.salient.choam.receipt.TransferRoute
 import java.io.File
 import java.security.MessageDigest
 import java.nio.file.Files
+import java.nio.file.FileVisitResult
 import java.nio.file.Path
 import java.nio.file.Paths
+import java.nio.file.SimpleFileVisitor
+import java.nio.file.attribute.BasicFileAttributes
 import java.time.Duration
 import java.time.Instant
 
@@ -59,14 +62,63 @@ class QueueProcessor(
         return TransferRoute(entry.retryCount.toLong(), "route-$digest")
     }
 
-    private fun admitReceipt(entry: TransferQueueEntry, source: File, route: NetworkRoute): Boolean {
-        val expectedFiles = if (source.isDirectory) source.walkTopDown().count { it.isFile }.toLong() else 1L
-        val expectedBytes = if (source.isDirectory) source.walkTopDown().filter { it.isFile }.sumOf { it.length() } else source.length()
-        return receiptStore.admit(entry.id, expectedBytes, expectedFiles, receiptRoute(entry, route)) is QueueReceiptStore.MutationResult.Applied
+    /**
+     * Receipt expectations are a guarded, single-pass snapshot.  A changing or unreadable tree
+     * simply has no receipt in this tranche; it is never a reason to alter legacy processing.
+     */
+    private fun receiptExpectations(entry: TransferQueueEntry, source: File): QueueReceiptStore.Expectations? {
+        receiptStore.reusableExpectations(entry.id)?.let { return it }
+        return try {
+            if (!source.isDirectory) {
+                val size = Files.readAttributes(source.toPath(), BasicFileAttributes::class.java).size()
+                QueueReceiptStore.Expectations(size, 1)
+            } else {
+                val root = Files.readAttributes(source.toPath(), BasicFileAttributes::class.java)
+                var files = 0L
+                var bytes = 0L
+                Files.walkFileTree(source.toPath(), object : SimpleFileVisitor<Path>() {
+                    override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
+                        if (attrs.isRegularFile && !isExcludedFromTree(file.fileName.toString())) {
+                            files = Math.addExact(files, 1L)
+                            bytes = Math.addExact(bytes, attrs.size())
+                        }
+                        return FileVisitResult.CONTINUE
+                    }
+
+                    override fun visitFileFailed(file: Path, exc: java.io.IOException): FileVisitResult =
+                        throw exc
+                })
+                val after = Files.readAttributes(source.toPath(), BasicFileAttributes::class.java)
+                if (root.size() != after.size() || root.lastModifiedTime() != after.lastModifiedTime()) null
+                else QueueReceiptStore.Expectations(bytes, files)
+            }
+        } catch (_: Exception) {
+            null
+        }
     }
 
-    private fun observeReceipt(entry: TransferQueueEntry, state: TransferReceiptState, failureCode: String? = null, processExitCode: Int? = null): Boolean =
-        receiptStore.observe(entry.id, state, failureCode, processExitCode) is QueueReceiptStore.MutationResult.Applied
+    private fun admitReceipt(entry: TransferQueueEntry, source: File, route: NetworkRoute): Boolean {
+        val expectations = receiptExpectations(entry, source) ?: return false
+        return when (receiptStore.admit(entry.id, expectations.bytes, expectations.files, receiptRoute(entry, route))) {
+            is QueueReceiptStore.MutationResult.Applied -> true
+            QueueReceiptStore.MutationResult.Unavailable -> {
+                logger.warn { "Receipt storage unavailable; legacy queue processing continues" }
+                false
+            }
+            else -> false
+        }
+    }
+
+    private fun observeReceipt(admitted: Boolean, entry: TransferQueueEntry, state: TransferReceiptState, failureCode: String? = null, processExitCode: Int? = null) {
+        if (!admitted) return
+        if (receiptStore.observe(entry.id, state, failureCode, processExitCode) == QueueReceiptStore.MutationResult.Unavailable) {
+            logger.warn { "Receipt storage unavailable; legacy queue processing continues" }
+        }
+    }
+
+    private fun observeExistingReceipt(entry: TransferQueueEntry, state: TransferReceiptState, failureCode: String) {
+        observeReceipt(receiptStore.load(entry.id) is QueueReceiptStore.ReadResult.Present, entry, state, failureCode)
+    }
 
     /**
      * Process all pending queue entries.
@@ -142,7 +194,8 @@ class QueueProcessor(
      */
     private fun failWithBackoff(entry: TransferQueueEntry, message: String, bytes: Long? = null) {
         // Error detail remains exclusively in the legacy queue. Receipts get a fixed code only.
-        observeReceipt(entry, TransferReceiptState.FAILED, failureCode = "PROCESSING_FAILED")
+        // A receipt is strictly observational.  Do not infer it exists or let it affect retry.
+        observeExistingReceipt(entry, TransferReceiptState.FAILED, "PROCESSING_FAILED")
         val newRetryCount = entry.retryCount + 1
         val exhausted = newRetryCount > TransferQueueEntry.MAX_RETRIES
         val nextRetry = if (exhausted) null else TransferQueueEntry.nextBackoff(newRetryCount)
@@ -204,14 +257,9 @@ class QueueProcessor(
         }
 
         val route = networkDetector.detectBestRoute(localMachine, remoteMachine)
-        if (!admitReceipt(entry, srcFile, route)) {
-            failWithBackoff(entry, "Receipt admission unavailable")
-            return SingleResult.FAILED
-        }
         val connectivity = networkDetector.testConnectivity(route)
         if (!connectivity.reachable) {
             echo("  ${entry.id}: ${remoteMachine.name} unreachable — will retry later")
-            observeReceipt(entry, TransferReceiptState.DEFERRED, failureCode = "NETWORK_DEFERRED")
             queue.defer(entry.id, "${remoteMachine.name} unreachable")
             return SingleResult.DEFERRED
         }
@@ -266,11 +314,10 @@ class QueueProcessor(
         val srcFile = File(entry.sourcePath)
         val effectiveBwLimit = bandwidthOverride ?: entry.bandwidthLimitKBps
 
-        // This is the first point at which source ownership is guarded.
-        if (!observeReceipt(entry, TransferReceiptState.ACTIVE)) {
-            failWithBackoff(entry, "Receipt activation unavailable")
-            return SingleResult.FAILED
-        }
+        // This is the first point at which source ownership is guarded.  Admission failure is
+        // receipt-only: transfer semantics, cancellation, and retry accounting stay legacy-owned.
+        val receiptAdmitted = admitReceipt(entry, srcFile, route)
+        observeReceipt(receiptAdmitted, entry, TransferReceiptState.ACTIVE)
 
         // ── PRE-FLIGHT SAFETY CHECK ──
         val preflightOutcome = SendPreflight.checkRemoteFiles(
@@ -288,7 +335,7 @@ class QueueProcessor(
             is PreflightOutcome.FallThrough -> {
                 // SSH unreachable for pre-flight — defer rather than proceeding blind
                 echo("  ${entry.id}: pre-flight SSH unreachable — deferring")
-                observeReceipt(entry, TransferReceiptState.DEFERRED, failureCode = "NETWORK_DEFERRED")
+                observeReceipt(receiptAdmitted, entry, TransferReceiptState.DEFERRED, failureCode = "NETWORK_DEFERRED")
                 queue.defer(entry.id, "pre-flight SSH unreachable")
                 return SingleResult.DEFERRED
             }
@@ -437,6 +484,10 @@ class QueueProcessor(
                             )
                         }
                     }
+                    // The local comparison above is authoritative for this legacy success path.
+                    // It may describe verification, but never destination commit or delivery.
+                    observeReceipt(receiptAdmitted, entry, TransferReceiptState.VERIFYING_BYTES, processExitCode = 0)
+                    observeReceipt(receiptAdmitted, entry, TransferReceiptState.VERIFYING_FILES, processExitCode = 0)
                     queue.update(entry.id) {
                         it.copy(status = TransferStatus.COMPLETED, completedAt = Instant.now().toString(), error = null)
                     }
@@ -556,12 +607,8 @@ class QueueProcessor(
 
                 // A zero rsync exit only begins local verification. It is never destination
                 // evidence, a destination commit, or a completed delivery assertion.
-                if (!observeReceipt(entry, TransferReceiptState.VERIFYING_BYTES, processExitCode = 0) ||
-                    !observeReceipt(entry, TransferReceiptState.VERIFYING_FILES, processExitCode = 0)
-                ) {
-                    failWithBackoff(entry, "Receipt verification observation unavailable", bytes)
-                    return SingleResult.FAILED
-                }
+                observeReceipt(receiptAdmitted, entry, TransferReceiptState.VERIFYING_BYTES, processExitCode = 0)
+                observeReceipt(receiptAdmitted, entry, TransferReceiptState.VERIFYING_FILES, processExitCode = 0)
 
                 // ── SOURCE GUARD: post-transfer verification ──
                 val sourceCheck = guard.verifySourceUnchanged()
@@ -738,7 +785,7 @@ class QueueProcessor(
 
                 echo("  ${entry.id}: ${result.message}$suffix")
 
-                observeReceipt(entry, TransferReceiptState.FAILED, failureCode = "TRANSFER_FAILED")
+                observeReceipt(receiptAdmitted, entry, TransferReceiptState.FAILED, failureCode = "TRANSFER_FAILED")
 
                 queue.update(entry.id) {
                     it.copy(

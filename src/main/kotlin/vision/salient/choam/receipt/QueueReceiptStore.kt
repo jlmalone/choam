@@ -17,33 +17,52 @@ import java.util.UUID
  */
 class QueueReceiptStore(private val dbPath: Path) {
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = false }
+    private val initialized: Boolean
 
     init {
-        Files.createDirectories(requireNotNull(dbPath.parent) { "queue database must have a parent" })
-        connection().use { conn ->
-            conn.createStatement().use { statement ->
-                statement.executeUpdate(
-                    "CREATE TABLE IF NOT EXISTS queue_transfer_receipts (" +
-                        "queue_entry_id TEXT PRIMARY KEY, receipt_json TEXT NOT NULL)"
-                )
+        // Receipt storage is deliberately optional.  It shares a database with the queue but
+        // must never make queue construction or processing depend on SQLite/schema health.
+        initialized = runCatching {
+            Files.createDirectories(requireNotNull(dbPath.parent) { "queue database must have a parent" })
+            connection().use { conn ->
+                conn.createStatement().use { statement ->
+                    statement.executeUpdate(
+                        "CREATE TABLE IF NOT EXISTS queue_transfer_receipts (" +
+                            "queue_entry_id TEXT PRIMARY KEY, receipt_json TEXT NOT NULL)"
+                    )
+                }
             }
-        }
+        }.isSuccess
     }
 
     sealed interface ReadResult {
         data object Missing : ReadResult
         data class Present(val receipt: TransferReceiptV1) : ReadResult
         data object Malformed : ReadResult
+        /** Sanitized operational state; never expose a JDBC, path, or schema error. */
+        data object Unavailable : ReadResult
     }
 
     sealed interface MutationResult {
         data class Applied(val receipt: TransferReceiptV1) : MutationResult
         data class Ignored(val receipt: TransferReceiptV1, val reason: String) : MutationResult
         data class Rejected(val reason: String) : MutationResult
+        /** Receipt-only failure.  Callers must leave the legacy queue outcome unchanged. */
+        data object Unavailable : MutationResult
     }
 
-    fun load(queueEntryId: String): ReadResult = connection().use { conn ->
-        read(conn, queueEntryId)
+    data class Expectations(val bytes: Long?, val files: Long?) {
+        init { require(bytes != null || files != null); require(bytes == null || bytes >= 0); require(files == null || files >= 0) }
+    }
+
+    fun load(queueEntryId: String): ReadResult = safelyRead { conn -> read(conn, queueEntryId) }
+
+    /** Reuse a valid non-terminal receipt's expectations so a retry does not re-walk its tree. */
+    fun reusableExpectations(queueEntryId: String): Expectations? = when (val loaded = load(queueEntryId)) {
+        is ReadResult.Present -> if (loaded.receipt.state !in setOf(TransferReceiptState.COMPLETED, TransferReceiptState.CANCELLED)) {
+            Expectations(loaded.receipt.expectedBytes, loaded.receipt.expectedFiles)
+        } else null
+        else -> null
     }
 
     /**
@@ -57,7 +76,7 @@ class QueueReceiptStore(private val dbPath: Path) {
         expectedFiles: Long?,
         route: TransferRoute,
         now: Instant = Instant.now(),
-    ): MutationResult = transaction { conn ->
+    ): MutationResult = safelyMutate { transaction { conn ->
         when (val existing = read(conn, queueEntryId)) {
             ReadResult.Missing -> {
                 val receipt = TransferReceiptV1(
@@ -89,11 +108,32 @@ class QueueReceiptStore(private val dbPath: Path) {
                     MutationResult.Applied(reopened)
                 }
                 TransferReceiptState.COMPLETED, TransferReceiptState.CANCELLED -> MutationResult.Rejected("TERMINAL_RECEIPT")
+                TransferReceiptState.ACTIVE, TransferReceiptState.VERIFYING_BYTES, TransferReceiptState.VERIFYING_FILES -> {
+                    // The legacy queue has claimed this entry again after reset/watchdog recovery.
+                    // Terminate the old attempt first; restart is then legal and keeps a durable
+                    // summary without changing any legacy retry counter.
+                    val deferred = applyAndWrite(conn, queueEntryId, existing.receipt, TransferReceiptObservation(
+                        observationId = observationId(), transferId = existing.receipt.transferId,
+                        attemptId = existing.receipt.attemptId,
+                        sequence = existing.receipt.lastAppliedObservationSequence + 1,
+                        observedAt = now, state = TransferReceiptState.DEFERRED,
+                        failureCode = "STALE_ATTEMPT_RECONCILED",
+                    ))
+                    if (deferred !is MutationResult.Applied) return@transaction deferred
+                    val restarted = try {
+                        TransferReceiptReducer.restart(deferred.receipt, attemptId(), now, "STALE_ATTEMPT_RECONCILED", route)
+                    } catch (_: IllegalArgumentException) {
+                        return@transaction MutationResult.Rejected("RECONCILE_REJECTED")
+                    }
+                    write(conn, queueEntryId, restarted)
+                    MutationResult.Applied(restarted)
+                }
                 else -> MutationResult.Applied(existing.receipt)
             }
             ReadResult.Malformed -> MutationResult.Rejected("MALFORMED_STORED_RECEIPT")
+            ReadResult.Unavailable -> MutationResult.Unavailable
         }
-    }
+    } }
 
     fun observe(
         queueEntryId: String,
@@ -101,10 +141,11 @@ class QueueReceiptStore(private val dbPath: Path) {
         failureCode: String? = null,
         processExitCode: Int? = null,
         now: Instant = Instant.now(),
-    ): MutationResult = transaction { conn ->
+    ): MutationResult = safelyMutate { transaction { conn ->
         when (val existing = read(conn, queueEntryId)) {
             ReadResult.Missing -> MutationResult.Rejected("MISSING_RECEIPT")
             ReadResult.Malformed -> MutationResult.Rejected("MALFORMED_STORED_RECEIPT")
+            ReadResult.Unavailable -> MutationResult.Unavailable
             is ReadResult.Present -> {
                 val observation = try {
                     TransferReceiptObservation(
@@ -118,16 +159,17 @@ class QueueReceiptStore(private val dbPath: Path) {
                 applyAndWrite(conn, queueEntryId, existing.receipt, observation)
             }
         }
-    }
+    } }
 
     /** Apply a caller-supplied observation without weakening reducer duplicate/sequence checks. */
-    fun apply(queueEntryId: String, observation: TransferReceiptObservation): MutationResult = transaction { conn ->
+    fun apply(queueEntryId: String, observation: TransferReceiptObservation): MutationResult = safelyMutate { transaction { conn ->
         when (val existing = read(conn, queueEntryId)) {
             ReadResult.Missing -> MutationResult.Rejected("MISSING_RECEIPT")
             ReadResult.Malformed -> MutationResult.Rejected("MALFORMED_STORED_RECEIPT")
+            ReadResult.Unavailable -> MutationResult.Unavailable
             is ReadResult.Present -> applyAndWrite(conn, queueEntryId, existing.receipt, observation)
         }
-    }
+    } }
 
     private fun applyAndWrite(
         conn: Connection,
@@ -182,9 +224,20 @@ class QueueReceiptStore(private val dbPath: Path) {
 
     private fun connection(): Connection = DriverManager.getConnection("jdbc:sqlite:$dbPath").also { conn ->
         conn.createStatement().use { statement ->
-            statement.executeUpdate("PRAGMA busy_timeout=5000")
+            // Do not wait behind a queue writer: receipt observation is best effort only.
+            statement.executeUpdate("PRAGMA busy_timeout=0")
             statement.executeUpdate("PRAGMA synchronous=NORMAL")
         }
+    }
+
+    private fun safelyRead(block: (Connection) -> ReadResult): ReadResult {
+        if (!initialized) return ReadResult.Unavailable
+        return runCatching { connection().use(block) }.getOrElse { ReadResult.Unavailable }
+    }
+
+    private fun safelyMutate(block: () -> MutationResult): MutationResult {
+        if (!initialized) return MutationResult.Unavailable
+        return runCatching(block).getOrElse { MutationResult.Unavailable }
     }
 
     private fun attemptId() = "attempt-" + UUID.randomUUID().toString()

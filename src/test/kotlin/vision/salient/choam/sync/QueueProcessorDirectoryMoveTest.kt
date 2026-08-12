@@ -103,6 +103,19 @@ class QueueProcessorDirectoryMoveTest {
     private fun correctRemoteEntry(file: File): Pair<Long, String?> =
         file.length() to PostTransferVerifier.computeSha256(file)
 
+    @Test
+    fun receiptExpectationTraversalHasUnreadableAndOverflowSeams() {
+        // Static adversarial check: production keeps these failure seams explicit without
+        // invoking a live queue, network route, or filesystem permission mutation in this test.
+        val source = File("src/main/kotlin/vision/salient/choam/sync/QueueProcessor.kt").readText()
+        val expectations = source.substringAfter("private fun receiptExpectations").substringBefore("private fun admitReceipt")
+        assertTrue("Files.walkFileTree" in expectations)
+        assertTrue("visitFileFailed" in expectations)
+        assertTrue("Math.addExact(files, 1L)" in expectations)
+        assertTrue("Math.addExact(bytes, attrs.size())" in expectations)
+        assertFalse("walkTopDown" in expectations)
+    }
+
     // ── All verified (size + hash match) ──
 
     @Test

@@ -64,6 +64,22 @@ new attempt and clears evidence. An rsync exit of zero progresses only through
 `VERIFYING_BYTES` and `VERIFYING_FILES`; this tranche never writes destination evidence,
 `DESTINATION_COMMITTED`, or `COMPLETED`.
 
+Receipt persistence is best-effort additive isolation, not a queue dependency. Initialization,
+schema and I/O errors, malformed stored rows, and lock contention yield only a sanitized internal
+receipt-unavailable condition; they never fail, defer, retry, cancel, or otherwise change legacy
+queue processing. No observation is claimed when it was not durably stored. Terminal receipt rows
+remain fail-closed. When a legacy reset or stale-running recovery makes an `ACTIVE` or verifying
+receipt claimable again, the producer first durably records `STALE_ATTEMPT_RECONCILED` as a
+deferred old attempt and then creates a fresh attempt/route; this does not consume a legacy retry.
+
+For directory sources the producer captures expected files and bytes in one guarded traversal,
+using checked arithmetic and treating unreadable or changing trees as receipt-ineligible while the
+legacy transfer continues. A valid current receipt reuses its durable expectations on retry.
+The already-present-at-destination legacy success path records no state past `VERIFYING_FILES`,
+and does so only after its authoritative local comparison. Receipt gaps are therefore expected
+whenever this optional side channel is unavailable or expectations cannot safely be established;
+they are not evidence of a missing legacy transfer outcome.
+
 Receipt and legacy queue updates currently use separate transactions on the same database. This is
 intentional: the established queue mutations and schema-1 status snapshot remain untouched. A
 future integration may introduce a single cross-table queue-state/receipt transaction only after

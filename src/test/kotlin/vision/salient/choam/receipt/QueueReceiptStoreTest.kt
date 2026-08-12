@@ -64,4 +64,55 @@ class QueueReceiptStoreTest {
         queue.clear(completedOnly = false)
         assertIs<QueueReceiptStore.ReadResult.Present>(store.load("queue-005"))
     }
+
+    @Test fun `stale active receipt is durably deferred then restarted with a fresh attempt`() {
+        val store = store()
+        val first = assertIs<QueueReceiptStore.MutationResult.Applied>(store.admit("queue-006", 12, 1, route)).receipt
+        assertIs<QueueReceiptStore.MutationResult.Applied>(store.observe("queue-006", TransferReceiptState.ACTIVE))
+
+        val restarted = assertIs<QueueReceiptStore.MutationResult.Applied>(
+            store.admit("queue-006", 12, 1, TransferRoute(1, "route-fingerprint-v1"))
+        ).receipt
+        assertEquals(TransferReceiptState.DEFERRED, restarted.state)
+        assertTrue(restarted.attemptId != first.attemptId)
+        assertEquals("STALE_ATTEMPT_RECONCILED", restarted.priorAttempts.single().failureCode)
+
+        store.observe("queue-006", TransferReceiptState.ACTIVE)
+        store.observe("queue-006", TransferReceiptState.VERIFYING_BYTES, processExitCode = 0)
+        store.observe("queue-006", TransferReceiptState.VERIFYING_FILES, processExitCode = 0)
+        assertEquals(TransferReceiptState.VERIFYING_FILES, (store.load("queue-006") as QueueReceiptStore.ReadResult.Present).receipt.state)
+    }
+
+    @Test fun `terminal receipt remains fail closed during a later claim`() {
+        val store = store()
+        store.admit("queue-009", 12, 1, route)
+        store.observe("queue-009", TransferReceiptState.CANCELLED)
+        assertIs<QueueReceiptStore.MutationResult.Rejected>(
+            store.admit("queue-009", 12, 1, TransferRoute(1, "route-fingerprint-v1"))
+        )
+    }
+
+    @Test fun `receipt initialization failure is sanitized and does not manufacture an observation`() {
+        // A file cannot be the parent directory. This is an injected filesystem failure seam;
+        // the store must stay usable as an unavailable receipt side channel, not throw.
+        val parentFile = Files.createTempFile("receipt-store-parent", ".tmp")
+        val unavailable = QueueReceiptStore(parentFile.resolve("queue.db"))
+        assertIs<QueueReceiptStore.MutationResult.Unavailable>(unavailable.admit("queue-007", 12, 1, route))
+        assertIs<QueueReceiptStore.ReadResult.Unavailable>(unavailable.load("queue-007"))
+    }
+
+    @Test fun `busy receipt transaction is unavailable rather than a legacy retry signal`() {
+        // Adversarial lock seam. This test is intentionally source-only in the constrained
+        // hardening pass; a normal test run may exercise it with the SQLite JDBC driver.
+        val db = Files.createTempDirectory("receipt-store-lock").resolve("queue.db")
+        val store = QueueReceiptStore(db)
+        store.admit("queue-008", 12, 1, route)
+        DriverManager.getConnection("jdbc:sqlite:$db").use { locked ->
+            locked.createStatement().use { it.execute("BEGIN EXCLUSIVE") }
+            assertIs<QueueReceiptStore.MutationResult.Unavailable>(
+                store.observe("queue-008", TransferReceiptState.ACTIVE)
+            )
+            locked.createStatement().use { it.execute("ROLLBACK") }
+        }
+    }
 }
