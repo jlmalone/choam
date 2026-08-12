@@ -36,9 +36,12 @@ data class ProcessingResult(
 internal fun alreadyPresentReceiptState(authoritativeComparison: Boolean): TransferReceiptState =
     if (authoritativeComparison) TransferReceiptState.VERIFYING_FILES else TransferReceiptState.DEFERRED
 
-/** A new receipt is eligible only for a no-follow-links regular-file observation. */
-internal fun receiptExpectationsFor(attributes: BasicFileAttributes?): QueueReceiptStore.Expectations? =
-    attributes?.takeIf { it.isRegularFile }?.let { QueueReceiptStore.Expectations(it.size(), 1) }
+/** A receipt attempt is eligible only for a no-follow-links regular-file observation. */
+internal fun receiptExpectationsFor(
+    attributes: BasicFileAttributes?,
+    reusable: QueueReceiptStore.Expectations? = null,
+): QueueReceiptStore.Expectations? =
+    attributes?.takeIf { it.isRegularFile }?.let { reusable ?: QueueReceiptStore.Expectations(it.size(), 1) }
 
 /**
  * Unified queue processor used by CLI, daemon, and web.
@@ -61,17 +64,15 @@ class QueueProcessor(
     /**
      * Only a regular file has a local expectation trusted by this tranche. New directory
      * receipts are deliberately ineligible: root metadata cannot prove a tree was stable.
-     * Existing durable expectations remain reusable without walking the source again.
+     * Every attempt revalidates the current source before it may reuse stored expectations.
      */
     private fun receiptExpectations(entry: TransferQueueEntry, source: File): QueueReceiptStore.Expectations? {
-        receiptStore.reusableExpectations(entry.id)?.let { return it }
-        return try {
-            receiptExpectationsFor(
-                Files.readAttributes(source.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
-            )
+        val attributes = try {
+            Files.readAttributes(source.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
         } catch (_: Exception) {
-            null
+            return null
         }
+        return receiptExpectationsFor(attributes, receiptStore.reusableExpectations(entry.id))
     }
 
     private fun admitReceipt(entry: TransferQueueEntry, source: File): Boolean {

@@ -120,6 +120,15 @@ class QueueProcessorDirectoryMoveTest {
         }
     }
 
+    @Test
+    fun receiptRetryRevalidatesSourceBeforeReusingDurableExpectations() {
+        val durable = vision.salient.choam.receipt.QueueReceiptStore.Expectations(17, 1)
+        assertEquals(durable, receiptExpectationsFor(attributes(regular = true, size = 99), durable))
+        listOf("directory", "symlink", "fifo", "socket", "device").forEach { kind ->
+            assertEquals(null, receiptExpectationsFor(attributes(regular = false, kind = kind), durable))
+        }
+    }
+
     private fun attributes(regular: Boolean, size: Long = 0, kind: String = "file") = object : BasicFileAttributes {
         override fun lastModifiedTime(): FileTime = FileTime.fromMillis(0)
         override fun lastAccessTime(): FileTime = FileTime.fromMillis(0)

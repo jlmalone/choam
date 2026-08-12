@@ -62,8 +62,9 @@ normal queue expiry only remove legacy queue rows, never receipt rows.
 `ACTIVE` only after `SourceGuard` ownership is acquired, and emits fixed-code `DEFERRED`, `FAILED`,
 or `CANCELLED` facts. No path, account, host, endpoint, route address, queue error, or process
 output is placed in a receipt. Each newly admitted or reconciled attempt receives a fresh opaque
-random route fingerprint; it is never derived from queue IDs, retry counts, paths, users, hosts,
-endpoints, or route addresses. Route generation is allocated monotonically from every persisted
+random route fingerprint that differs from every current and retained prior receipt fingerprint;
+it is never derived from queue IDs, retry counts, paths, users, hosts, endpoints, or route
+addresses. Route generation is allocated monotonically from every persisted
 current/prior receipt route with checked overflow, so a legacy manual reset to retry zero still
 creates a distinct generation and fingerprint. Retry/reopen clears evidence. An rsync exit of zero
 progresses only through
@@ -80,11 +81,13 @@ deferred old attempt and then creates a fresh attempt/route. Receipt reconciliat
 additional retry solely because of receipt state; the established legacy stale-running recovery
 may apply its own retry policy unchanged.
 
-For a new receipt, admission reads `BasicFileAttributes` with `NOFOLLOW_LINKS` and accepts only
-`isRegularFile`. Directories, symbolic links, FIFOs, sockets, devices, and unreadable sources are
-ineligible because root metadata cannot establish a stable transferable file. A valid current
-receipt may reuse its durable expectations on retry, while legacy processing of all source kinds
-continues unchanged. The already-present-at-destination legacy success path
+For a new or reopened receipt attempt, admission reads current `BasicFileAttributes` with
+`NOFOLLOW_LINKS` before any durable expectation reuse and accepts only `isRegularFile`.
+Directories, symbolic links, FIFOs, sockets, devices, and unreadable sources are ineligible
+because root metadata cannot establish a stable transferable file. A valid current receipt may
+reuse its durable expectations on retry only after that current-source revalidation, while legacy
+processing of all source kinds continues unchanged. The already-present-at-destination legacy
+success path
 records `VERIFYING_BYTES` and `VERIFYING_FILES` only after matching checksums or an authoritative
 hash comparison. A metadata-only COPY remains a legacy success but records sanitized `DEFERRED`
 with `AUTHORITATIVE_VERIFICATION_REQUIRED`, never verification. Receipt gaps are therefore

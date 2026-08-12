@@ -156,4 +156,20 @@ class QueueReceiptStoreTest {
         )
         assertNull(nextReceiptRoute(exhausted, "route-nonce-unused"))
     }
+
+    @Test fun `route allocation rejects fingerprints from current and prior attempts`() {
+        val previous = TransferReceiptV1(
+            transferId = "transfer-003", attemptId = "attempt-003", queueEntryId = null,
+            sourceAuthority = TransferAuthority("LOCAL"), destinationAuthority = TransferAuthority("DESTINATION"),
+            route = TransferRoute(3, "route-nonce-current"), expectedBytes = 1,
+            timestamps = TransferTimestamps(Instant.EPOCH),
+            priorAttempts = listOf(
+                PriorAttemptSummary("attempt-002", TransferReceiptState.DEFERRED, Instant.EPOCH,
+                    route = TransferRoute(2, "route-nonce-prior"))
+            ),
+        )
+        assertNull(nextReceiptRoute(previous, "route-nonce-current"))
+        assertNull(nextReceiptRoute(previous, "route-nonce-prior"))
+        assertEquals(4, nextReceiptRoute(previous, "route-nonce-fresh")?.generation)
+    }
 }

@@ -20,6 +20,10 @@ class QueueReceiptStore(
     private val dbPath: Path,
     private val freshRouteFingerprint: () -> String = { "route-" + UUID.randomUUID() },
 ) {
+    private companion object {
+        const val MAX_ROUTE_FINGERPRINT_ATTEMPTS = 8
+    }
+
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = false }
     private val initialized: Boolean
 
@@ -85,7 +89,7 @@ class QueueReceiptStore(
     ): MutationResult = safelyMutate {
         when (val existing = readCurrent(queueEntryId)) {
             ReadResult.Missing -> {
-                val route = nextRoute(null) ?: return@safelyMutate MutationResult.Rejected("ROUTE_GENERATION_EXHAUSTED")
+                val route = nextRoute(null) ?: return@safelyMutate MutationResult.Rejected("ROUTE_IDENTITY_UNAVAILABLE")
                 val receipt = TransferReceiptV1(
                     transferId = transferId(queueEntryId),
                     attemptId = attemptId(),
@@ -106,7 +110,7 @@ class QueueReceiptStore(
             }
             is ReadResult.Present -> when (existing.receipt.state) {
                 TransferReceiptState.DEFERRED, TransferReceiptState.FAILED -> {
-                    val route = nextRoute(existing.receipt) ?: return@safelyMutate MutationResult.Rejected("ROUTE_GENERATION_EXHAUSTED")
+                    val route = nextRoute(existing.receipt) ?: return@safelyMutate MutationResult.Rejected("ROUTE_IDENTITY_UNAVAILABLE")
                     val reopened = try {
                         TransferReceiptReducer.restart(existing.receipt, attemptId(), now, "RETRY_REOPENED", route)
                     } catch (_: IllegalArgumentException) {
@@ -276,8 +280,17 @@ class QueueReceiptStore(
         return runCatching(block).getOrElse { MutationResult.Unavailable }
     }
 
-    private fun nextRoute(previous: TransferReceiptV1?): TransferRoute? =
-        nextReceiptRoute(previous, freshRouteFingerprint())
+    /**
+     * Random identity collisions are astronomically unlikely, but must not weaken receipt
+     * isolation. Limit allocation so a faulty entropy source cannot block legacy processing.
+     */
+    private fun nextRoute(previous: TransferReceiptV1?): TransferRoute? {
+        repeat(MAX_ROUTE_FINGERPRINT_ATTEMPTS) {
+            val fingerprint = runCatching(freshRouteFingerprint).getOrNull() ?: return@repeat
+            runCatching { nextReceiptRoute(previous, fingerprint) }.getOrNull()?.let { return it }
+        }
+        return null
+    }
 
     private fun attemptId() = "attempt-" + UUID.randomUUID().toString()
     private fun observationId() = "observation-" + UUID.randomUUID().toString()
@@ -290,6 +303,10 @@ class QueueReceiptStore(
 
 /** Allocates a route from receipt state alone, using already-opaque random fingerprint material. */
 internal fun nextReceiptRoute(previous: TransferReceiptV1?, freshFingerprint: String): TransferRoute? {
+    val usedFingerprints = previous?.let { receipt ->
+        setOf(receipt.route.fingerprint) + receipt.priorAttempts.map { it.route.fingerprint }
+    }.orEmpty()
+    if (freshFingerprint in usedFingerprints) return null
     val previousGeneration = previous?.let { receipt ->
         (listOf(receipt.route) + receipt.priorAttempts.map { it.route }).maxOf { it.generation }
     } ?: return TransferRoute(0, freshFingerprint)
