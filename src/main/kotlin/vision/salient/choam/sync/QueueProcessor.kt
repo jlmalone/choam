@@ -8,10 +8,9 @@ import vision.salient.choam.lowPriority
 import vision.salient.choam.network.*
 import vision.salient.choam.receipt.QueueReceiptStore
 import vision.salient.choam.receipt.TransferReceiptState
-import vision.salient.choam.receipt.TransferRoute
 import java.io.File
-import java.security.MessageDigest
 import java.nio.file.Files
+import java.nio.file.LinkOption.NOFOLLOW_LINKS
 import java.nio.file.Path
 import java.nio.file.Paths
 import java.nio.file.attribute.BasicFileAttributes
@@ -37,6 +36,10 @@ data class ProcessingResult(
 internal fun alreadyPresentReceiptState(authoritativeComparison: Boolean): TransferReceiptState =
     if (authoritativeComparison) TransferReceiptState.VERIFYING_FILES else TransferReceiptState.DEFERRED
 
+/** A new receipt is eligible only for a no-follow-links regular-file observation. */
+internal fun receiptExpectationsFor(attributes: BasicFileAttributes?): QueueReceiptStore.Expectations? =
+    attributes?.takeIf { it.isRegularFile }?.let { QueueReceiptStore.Expectations(it.size(), 1) }
+
 /**
  * Unified queue processor used by CLI, daemon, and web.
  *
@@ -55,15 +58,6 @@ class QueueProcessor(
     private val networkDetector = NetworkDetector()
     private val receiptStore = QueueReceiptStore(queue.receiptDatabasePath)
 
-    private fun receiptRoute(entry: TransferQueueEntry, route: NetworkRoute): TransferRoute {
-        // Deliberately fingerprint only an opaque queue ID, retry generation, and route mode.
-        // NetworkRoute addresses, machine names, and endpoint details never enter receipt storage.
-        val material = "${entry.id}:${entry.retryCount}:${route.mode.name}".toByteArray()
-        val digest = MessageDigest.getInstance("SHA-256").digest(material)
-            .joinToString("") { "%02x".format(it.toInt() and 0xff) }
-        return TransferRoute(entry.retryCount.toLong(), "route-$digest")
-    }
-
     /**
      * Only a regular file has a local expectation trusted by this tranche. New directory
      * receipts are deliberately ineligible: root metadata cannot prove a tree was stable.
@@ -72,20 +66,17 @@ class QueueProcessor(
     private fun receiptExpectations(entry: TransferQueueEntry, source: File): QueueReceiptStore.Expectations? {
         receiptStore.reusableExpectations(entry.id)?.let { return it }
         return try {
-            if (source.isDirectory) {
-                null
-            } else {
-                val size = Files.readAttributes(source.toPath(), BasicFileAttributes::class.java).size()
-                QueueReceiptStore.Expectations(size, 1)
-            }
+            receiptExpectationsFor(
+                Files.readAttributes(source.toPath(), BasicFileAttributes::class.java, NOFOLLOW_LINKS)
+            )
         } catch (_: Exception) {
             null
         }
     }
 
-    private fun admitReceipt(entry: TransferQueueEntry, source: File, route: NetworkRoute): Boolean {
+    private fun admitReceipt(entry: TransferQueueEntry, source: File): Boolean {
         val expectations = receiptExpectations(entry, source) ?: return false
-        return when (receiptStore.admit(entry.id, expectations.bytes, expectations.files, receiptRoute(entry, route))) {
+        return when (receiptStore.admit(entry.id, expectations.bytes, expectations.files)) {
             is QueueReceiptStore.MutationResult.Applied -> true
             QueueReceiptStore.MutationResult.Unavailable -> {
                 logger.warn { "Receipt storage unavailable; legacy queue processing continues" }
@@ -302,7 +293,7 @@ class QueueProcessor(
 
         // This is the first point at which source ownership is guarded.  Admission failure is
         // receipt-only: transfer semantics, cancellation, and retry accounting stay legacy-owned.
-        val receiptAdmitted = admitReceipt(entry, srcFile, route)
+        val receiptAdmitted = admitReceipt(entry, srcFile)
         observeReceipt(receiptAdmitted, entry, TransferReceiptState.ACTIVE)
 
         // ── PRE-FLIGHT SAFETY CHECK ──

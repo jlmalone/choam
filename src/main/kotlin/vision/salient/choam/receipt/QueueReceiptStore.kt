@@ -16,7 +16,10 @@ import java.util.UUID
  * optimistic compare-and-swap statement, so a committed observation is durably idempotent
  * after a restart without receipt work blocking legacy queue writers.
  */
-class QueueReceiptStore(private val dbPath: Path) {
+class QueueReceiptStore(
+    private val dbPath: Path,
+    private val freshRouteFingerprint: () -> String = { "route-" + UUID.randomUUID() },
+) {
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = false }
     private val initialized: Boolean
 
@@ -70,18 +73,19 @@ class QueueReceiptStore(private val dbPath: Path) {
 
     /**
      * Create the admission receipt once expectations are known.  A retry only reopens a
-     * deferred/failed receipt and gets a fresh attempt ID; malformed or terminal storage is
-     * rejected without replacement.
+     * deferred/failed receipt and gets a fresh attempt ID and route identity; malformed or
+     * terminal storage is rejected without replacement. Route generation belongs to receipts,
+     * not the legacy queue retry counter.
      */
     fun admit(
         queueEntryId: String,
         expectedBytes: Long?,
         expectedFiles: Long?,
-        route: TransferRoute,
         now: Instant = Instant.now(),
     ): MutationResult = safelyMutate {
         when (val existing = readCurrent(queueEntryId)) {
             ReadResult.Missing -> {
+                val route = nextRoute(null) ?: return@safelyMutate MutationResult.Rejected("ROUTE_GENERATION_EXHAUSTED")
                 val receipt = TransferReceiptV1(
                     transferId = transferId(queueEntryId),
                     attemptId = attemptId(),
@@ -102,6 +106,7 @@ class QueueReceiptStore(private val dbPath: Path) {
             }
             is ReadResult.Present -> when (existing.receipt.state) {
                 TransferReceiptState.DEFERRED, TransferReceiptState.FAILED -> {
+                    val route = nextRoute(existing.receipt) ?: return@safelyMutate MutationResult.Rejected("ROUTE_GENERATION_EXHAUSTED")
                     val reopened = try {
                         TransferReceiptReducer.restart(existing.receipt, attemptId(), now, "RETRY_REOPENED", route)
                     } catch (_: IllegalArgumentException) {
@@ -125,7 +130,7 @@ class QueueReceiptStore(private val dbPath: Path) {
                     // The reconciliation observation is durable before reopening.  Re-read and
                     // CAS the fresh attempt separately; neither operation holds a write lock
                     // while decoding or reducing JSON.
-                    else admit(queueEntryId, expectedBytes, expectedFiles, route, now)
+                    else admit(queueEntryId, expectedBytes, expectedFiles, now)
                 }
                 else -> MutationResult.Applied(existing.receipt)
             }
@@ -271,6 +276,9 @@ class QueueReceiptStore(private val dbPath: Path) {
         return runCatching(block).getOrElse { MutationResult.Unavailable }
     }
 
+    private fun nextRoute(previous: TransferReceiptV1?): TransferRoute? =
+        nextReceiptRoute(previous, freshRouteFingerprint())
+
     private fun attemptId() = "attempt-" + UUID.randomUUID().toString()
     private fun observationId() = "observation-" + UUID.randomUUID().toString()
     private fun transferId(queueEntryId: String): String {
@@ -278,4 +286,17 @@ class QueueReceiptStore(private val dbPath: Path) {
             .joinToString("") { "%02x".format(it.toInt() and 0xff) }
         return "transfer-${digest.take(48)}"
     }
+}
+
+/** Allocates a route from receipt state alone, using already-opaque random fingerprint material. */
+internal fun nextReceiptRoute(previous: TransferReceiptV1?, freshFingerprint: String): TransferRoute? {
+    val previousGeneration = previous?.let { receipt ->
+        (listOf(receipt.route) + receipt.priorAttempts.map { it.route }).maxOf { it.generation }
+    } ?: return TransferRoute(0, freshFingerprint)
+    val nextGeneration = try {
+        Math.addExact(previousGeneration, 1L)
+    } catch (_: ArithmeticException) {
+        return null
+    }
+    return TransferRoute(nextGeneration, freshFingerprint)
 }

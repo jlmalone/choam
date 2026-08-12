@@ -6,6 +6,8 @@ import org.junit.jupiter.api.Test
 import vision.salient.choam.receipt.TransferReceiptState
 import java.io.File
 import java.nio.file.Path
+import java.nio.file.attribute.BasicFileAttributes
+import java.nio.file.attribute.FileTime
 import kotlin.io.path.createTempDirectory
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -108,6 +110,26 @@ class QueueProcessorDirectoryMoveTest {
     fun alreadyPresentReceiptStateRequiresAuthoritativeComparison() {
         assertEquals(TransferReceiptState.DEFERRED, alreadyPresentReceiptState(authoritativeComparison = false))
         assertEquals(TransferReceiptState.VERIFYING_FILES, alreadyPresentReceiptState(authoritativeComparison = true))
+    }
+
+    @Test
+    fun receiptExpectationEligibilityRejectsEveryNonregularAttributeKind() {
+        assertEquals(17, receiptExpectationsFor(attributes(regular = true, size = 17))?.bytes)
+        listOf("directory", "symlink", "fifo", "socket", "device").forEach { kind ->
+            assertEquals(null, receiptExpectationsFor(attributes(regular = false, kind = kind)))
+        }
+    }
+
+    private fun attributes(regular: Boolean, size: Long = 0, kind: String = "file") = object : BasicFileAttributes {
+        override fun lastModifiedTime(): FileTime = FileTime.fromMillis(0)
+        override fun lastAccessTime(): FileTime = FileTime.fromMillis(0)
+        override fun creationTime(): FileTime = FileTime.fromMillis(0)
+        override fun isRegularFile(): Boolean = regular
+        override fun isDirectory(): Boolean = kind == "directory"
+        override fun isSymbolicLink(): Boolean = kind == "symlink"
+        override fun isOther(): Boolean = kind in setOf("fifo", "socket", "device")
+        override fun size(): Long = size
+        override fun fileKey(): Any? = null
     }
 
     // ── All verified (size + hash match) ──
