@@ -5,6 +5,7 @@ import kotlinx.serialization.json.Json
 import mu.KotlinLogging
 import vision.salient.choam.config.MachineProfile
 import vision.salient.choam.lowPriority
+import vision.salient.choam.niceRemote
 import vision.salient.choam.network.NetworkRoute
 import java.io.File
 
@@ -121,7 +122,7 @@ data class ChoamManifest(
                     "-o", "ConnectTimeout=10",
                     "-o", "BatchMode=yes",
                     "$user@$host",
-                    "bash -s"
+                    niceRemote("bash -s")
                 )
             )
 

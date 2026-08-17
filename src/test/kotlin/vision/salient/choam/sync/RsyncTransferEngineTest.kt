@@ -56,7 +56,7 @@ class RsyncTransferEngineTest {
             route = route,
             remoteRsyncPath = "/opt/homebrew/bin/rsync"
         )
-        assertTrue(cmd.contains("--rsync-path=/opt/homebrew/bin/rsync"))
+        assertTrue(cmd.contains("--rsync-path=nice -n 19 /opt/homebrew/bin/rsync"))
     }
 
     @Test

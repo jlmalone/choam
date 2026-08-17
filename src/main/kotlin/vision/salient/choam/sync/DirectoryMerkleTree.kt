@@ -3,6 +3,7 @@ package vision.salient.choam.sync
 import mu.KotlinLogging
 import vision.salient.choam.config.MachineProfile
 import vision.salient.choam.lowPriority
+import vision.salient.choam.niceRemote
 import vision.salient.choam.network.NetworkRoute
 import java.io.File
 import java.security.MessageDigest
@@ -261,7 +262,7 @@ class DirectoryMerkleTree private constructor(
                     "-o", "ServerAliveInterval=30",
                     "-o", "ServerAliveCountMax=5",
                     "$user@$host",
-                    "bash -s"
+                    niceRemote("bash -s")
                 )
             )
 

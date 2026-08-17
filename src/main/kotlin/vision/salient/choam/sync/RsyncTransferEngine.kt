@@ -9,6 +9,7 @@ import vision.salient.choam.network.TransferResult
 import vision.salient.choam.network.classifyRsyncExit
 import vision.salient.choam.DEFAULT_BWLIMIT_KBPS
 import vision.salient.choam.lowPriority
+import vision.salient.choam.niceRemote
 import java.io.BufferedReader
 import java.io.File
 import java.io.IOException
@@ -59,9 +60,9 @@ class RsyncTransferEngine {
                     add("-o"); add("ConnectTimeout=10")
                     add("-o"); add("BatchMode=yes")
                     add(target)
-                    add(script)
+                    add(niceRemote("sh -c '${script.replace("'", "'\\''")}'"))
                 }
-                val process = ProcessBuilder(cmd).start()
+                val process = ProcessBuilder(lowPriority(cmd)).start()
                 val output = process.inputStream.bufferedReader().readText().trim()
                 if (!process.waitFor(20, TimeUnit.SECONDS)) {
                     process.destroyForcibly()
@@ -238,7 +239,7 @@ class RsyncTransferEngine {
             add("-e")
             add(sshOpts)
             if (remoteRsyncPath != null) {
-                add("--rsync-path=$remoteRsyncPath")
+                add("--rsync-path=${niceRemote(remoteRsyncPath)}")
             }
         }
 

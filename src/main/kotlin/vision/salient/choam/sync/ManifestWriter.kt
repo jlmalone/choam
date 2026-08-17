@@ -3,6 +3,7 @@ package vision.salient.choam.sync
 import mu.KotlinLogging
 import vision.salient.choam.config.MachineProfile
 import vision.salient.choam.lowPriority
+import vision.salient.choam.niceRemote
 import vision.salient.choam.network.NetworkRoute
 import java.io.File
 
@@ -123,7 +124,7 @@ object ManifestWriter {
                 "-o", "ConnectTimeout=10",
                 "-o", "BatchMode=yes",
                 "$user@$host",
-                "cat > '$escapedPath'"
+                niceRemote("sh -c 'cat > \\\'$escapedPath\\\''")
             )
         )
 

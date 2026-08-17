@@ -4,6 +4,7 @@ import mu.KotlinLogging
 import vision.salient.choam.SSH_PROBE_TIMEOUT_SEC
 import vision.salient.choam.config.MachineProfile
 import vision.salient.choam.lowPriority
+import vision.salient.choam.niceRemote
 import vision.salient.choam.network.NetworkRoute
 import vision.salient.choam.runBounded
 import java.io.File
@@ -114,7 +115,7 @@ object SendPreflight {
                     "-o", "ServerAliveInterval=15",
                     "-o", "ServerAliveCountMax=4",
                     "$user@$host",
-                    "test -d '$destDir' && echo EXISTS || echo MISSING"
+                    niceRemote("sh -c 'test -d \\\'$destDir\\\' && echo EXISTS || echo MISSING'")
                 )
             )
             try {
@@ -196,7 +197,7 @@ object SendPreflight {
                 "-o", "ServerAliveInterval=15",
                 "-o", "ServerAliveCountMax=4",
                 "$user@$host",
-                renameCommands
+                niceRemote("sh -c '${renameCommands.replace("'", "'\\''")}'")
             )
         )
 
@@ -470,7 +471,7 @@ object SendPreflight {
                 "-o", "ServerAliveInterval=15",
                 "-o", "ServerAliveCountMax=4",
                 "$user@$host",
-                "bash -s"
+                niceRemote("bash -s")
             )
         )
 
