@@ -54,12 +54,17 @@ fun Route.actionApiRoutes(config: ChoamConfig, scheduler: DaemonScheduler?) {
     // --- Action triggers ---
 
     post("/api/catalog-sync") {
+        if (scheduler == null) {
+            call.respond(
+                HttpStatusCode.ServiceUnavailable,
+                mapOf("status" to "unavailable", "message" to "Daemon scheduler not running.")
+            )
+            return@post
+        }
         DaemonState.logActivity("api_trigger", "Catalog sync triggered via API")
         application.launch {
             try {
-                // Trigger catalog freshness check as a lightweight stand-in
-                // Full catalog-sync requires SSH and is better run via CLI
-                scheduler?.triggerTask("catalog_freshness")
+                scheduler.triggerTask("catalog_freshness")
                 DaemonState.logActivity("catalog_sync", "Catalog freshness check completed")
             } catch (e: Exception) {
                 DaemonState.logActivity("catalog_sync", "Failed: ${e.message}", success = false)
@@ -69,16 +74,13 @@ fun Route.actionApiRoutes(config: ChoamConfig, scheduler: DaemonScheduler?) {
     }
 
     post("/api/fulfill") {
-        DaemonState.logActivity("api_trigger", "Fulfill triggered via API")
-        application.launch {
-            try {
-                // Log that fulfill was requested — actual execution requires rsync
-                DaemonState.logActivity("fulfill", "Fulfill request queued (run 'choam fulfill' for execution)")
-            } catch (e: Exception) {
-                DaemonState.logActivity("fulfill", "Failed: ${e.message}", success = false)
-            }
-        }
-        call.respond(mapOf("status" to "started", "task" to "fulfill"))
+        call.respond(
+            HttpStatusCode.NotImplemented,
+            mapOf(
+                "status" to "unavailable",
+                "message" to "Fulfill is not available via the web API. Run 'choam fulfill' from the CLI."
+            )
+        )
     }
 
     post("/api/daemon/pause") {
@@ -94,20 +96,41 @@ fun Route.actionApiRoutes(config: ChoamConfig, scheduler: DaemonScheduler?) {
     }
 
     post("/api/dag-sync") {
+        if (scheduler == null) {
+            call.respond(
+                HttpStatusCode.ServiceUnavailable,
+                mapOf("status" to "unavailable", "message" to "Daemon scheduler not running.")
+            )
+            return@post
+        }
         DaemonState.logActivity("api_trigger", "DAG sync triggered via API")
-        scheduler?.triggerTask("dag_sync")
+        scheduler.triggerTask("dag_sync")
         call.respond(mapOf("status" to "started", "task" to "dag-sync"))
     }
 
     post("/api/peer-check") {
+        if (scheduler == null) {
+            call.respond(
+                HttpStatusCode.ServiceUnavailable,
+                mapOf("status" to "unavailable", "message" to "Daemon scheduler not running.")
+            )
+            return@post
+        }
         DaemonState.logActivity("api_trigger", "Peer reachability check triggered via API")
-        scheduler?.triggerTask("peer_reachability")
+        scheduler.triggerTask("peer_reachability")
         call.respond(mapOf("status" to "started", "task" to "peer-check"))
     }
 
     post("/api/drive-check") {
+        if (scheduler == null) {
+            call.respond(
+                HttpStatusCode.ServiceUnavailable,
+                mapOf("status" to "unavailable", "message" to "Daemon scheduler not running.")
+            )
+            return@post
+        }
         DaemonState.logActivity("api_trigger", "Drive health check triggered via API")
-        scheduler?.triggerTask("drive_health")
+        scheduler.triggerTask("drive_health")
         call.respond(mapOf("status" to "started", "task" to "drive-check"))
     }
 

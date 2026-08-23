@@ -26,7 +26,7 @@ Built for the scenario where you have terabytes of media spread across a desktop
 - **Sietch integration** — file cataloging with SHA-256 hashes, catalogs cached on drives
 - **Bidirectional sync** with conflict detection and resolution
 - **Four conflict strategies**: newer wins, larger wins, keep both, manual
-- **SHA-256 verification** on every transferred file
+- **SHA-256 verification** on verified MOVE transfers and selected copy paths; see `docs/TRANSFER_RECEIPTS_V1.md` for completion semantics
 - **Bandwidth throttling** to avoid saturating your network
 - **Dry-run mode** to preview changes before executing
 - **Database-aware sync** with atomic operations for SQLite files
@@ -225,7 +225,7 @@ Named after the **Combine Honnete Ober Advancer Mercantiles** from Frank Herbert
 
 ## Status
 
-Phases 1 through 9.10 complete (2026-04-04). Full-featured multi-machine sync with federation, health reporting, source protection (SourceGuard), content-verified MOVE, Merkle pre-flight, and browser UI. 939 tests.
+Phases 1 through 9.10 complete (2026-04-04). Multi-machine sync with federation, health reporting, source protection (SourceGuard), verified MOVE on the queue path, Merkle pre-flight, and a loopback-only browser UI.
 
 Features:
 - `push`/`pull` commands with auto-target resolution
