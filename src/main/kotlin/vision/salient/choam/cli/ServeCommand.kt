@@ -29,9 +29,9 @@ class ServeCommand : CliktCommand(
         monitoring (peer reachability, catalog freshness, drive health).
 
         Key behaviors:
-          - Serves on localhost (configurable port)
+          - Binds to loopback (127.0.0.1) only; port is configurable
           - Content proxy: streams from local files or IPFS gateway
-          - CORS enabled for cross-project browser access
+          - CORS limited to loopback origins for local browser access
           - HTMX for dynamic updates without a JS build step
 
         Examples:
@@ -80,7 +80,7 @@ class ServeCommand : CliktCommand(
             echo("Press Ctrl+C to stop.")
         }
 
-        embeddedServer(CIO, port = portNum) {
+        embeddedServer(CIO, host = "127.0.0.1", port = portNum) {
             configureRouting(config, scheduler)
         }.start(wait = true)
     }
