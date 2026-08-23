@@ -19,7 +19,8 @@ fun Application.configureRouting(config: ChoamConfig, scheduler: DaemonScheduler
     }
 
     install(CORS) {
-        anyHost()
+        allowHost("localhost", schemes = listOf("http"))
+        allowHost("127.0.0.1", schemes = listOf("http"))
         allowMethod(HttpMethod.Get)
         allowMethod(HttpMethod.Head)
         allowMethod(HttpMethod.Post)
@@ -124,14 +125,17 @@ fun Application.configureRouting(config: ChoamConfig, scheduler: DaemonScheduler
         // Process queue — triggers the daemon's queue processor only.
         // Web UI never spawns its own queue processor thread.
         post("/api/queue/process") {
-            if (scheduler != null) {
-                scheduler.triggerTask("queue_processor")
-                call.respondRedirect("/queue")
+            val error = when {
+                scheduler == null ->
+                    "No daemon running. Start with 'choam serve --daemon' or process via 'choam queue --run'."
+                !scheduler.triggerTask("queue_processor") ->
+                    "Queue processing is not available from the web dashboard. Use 'choam queue --run' or autodrain."
+                else -> null
+            }
+            if (error != null) {
+                call.respondRedirect("/queue?error=${java.net.URLEncoder.encode(error, "UTF-8")}")
             } else {
-                // No daemon running — refuse to process. Operator must start daemon or use CLI.
-                call.respondRedirect("/queue?error=${java.net.URLEncoder.encode(
-                    "No daemon running. Start with 'choam daemon start' or process via 'choam queue --run'.", "UTF-8"
-                )}")
+                call.respondRedirect("/queue")
             }
         }
 
