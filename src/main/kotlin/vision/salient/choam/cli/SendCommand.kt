@@ -284,9 +284,9 @@ class SendCommand : CliktCommand(
                 }
             }
             is PreflightOutcome.FallThrough -> {
-                // SSH pre-flight failed — can't check remote state, but that doesn't mean there's a conflict.
-                // Proceed with the transfer; rsync will handle connectivity errors on its own.
-                echo("\n  \u001b[33mPre-flight check skipped (SSH unreachable). Transfer will proceed — rsync handles retries.\u001b[0m")
+                echo("\n  \u001b[31mPre-flight check could not reach destination (SSH unreachable). Transfer aborted.\u001b[0m")
+                echo("  Resolve connectivity and retry, or use 'choam send --queue' to defer processing.")
+                exitProcess(1)
             }
             is PreflightOutcome.UnsafeAbort -> {
                 echo("\n  \u001b[31mPre-flight ABORTED: ${preflightOutcome.reason}\u001b[0m")
