@@ -3,7 +3,7 @@
 ## Build Issues
 
 - **Gradle cannot find a JDK** — Ensure JDK 21+ is available. Set `JAVA_HOME` to Corretto 21 (`~/Library/Java/JavaVirtualMachines/corretto-21.0.7/Contents/Home`) or let Gradle toolchains download one.
-- **Sietch composite build fails** — Ensure `../sietch` exists relative to CHOAM root. The `settings.gradle.kts` uses `includeBuild("../Sietch")`.
+- **Sietch composite build fails** — Ensure `../sietch` exists relative to CHOAM root. The `settings.gradle.kts` uses `includeBuild("../sietch")`.
 
 ## Configuration
 

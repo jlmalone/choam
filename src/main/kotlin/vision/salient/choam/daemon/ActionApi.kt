@@ -5,7 +5,6 @@ import io.ktor.server.application.*
 import io.ktor.server.html.*
 import io.ktor.server.response.*
 import io.ktor.server.routing.*
-import kotlinx.coroutines.launch
 import kotlinx.html.*
 import mu.KotlinLogging
 import vision.salient.choam.config.ChoamConfig
@@ -61,15 +60,14 @@ fun Route.actionApiRoutes(config: ChoamConfig, scheduler: DaemonScheduler?) {
             )
             return@post
         }
-        DaemonState.logActivity("api_trigger", "Catalog sync triggered via API")
-        application.launch {
-            try {
-                scheduler.triggerTask("catalog_freshness")
-                DaemonState.logActivity("catalog_sync", "Catalog freshness check completed")
-            } catch (e: Exception) {
-                DaemonState.logActivity("catalog_sync", "Failed: ${e.message}", success = false)
-            }
+        if (!scheduler.triggerTask("catalog_freshness")) {
+            call.respond(
+                HttpStatusCode.Conflict,
+                mapOf("status" to "unavailable", "message" to "Catalog freshness task unavailable.")
+            )
+            return@post
         }
+        DaemonState.logActivity("api_trigger", "Catalog freshness check triggered via API")
         call.respond(mapOf("status" to "started", "task" to "catalog-sync"))
     }
 
@@ -103,8 +101,14 @@ fun Route.actionApiRoutes(config: ChoamConfig, scheduler: DaemonScheduler?) {
             )
             return@post
         }
+        if (!scheduler.triggerTask("dag_sync")) {
+            call.respond(
+                HttpStatusCode.Conflict,
+                mapOf("status" to "unavailable", "message" to "DAG sync task unavailable.")
+            )
+            return@post
+        }
         DaemonState.logActivity("api_trigger", "DAG sync triggered via API")
-        scheduler.triggerTask("dag_sync")
         call.respond(mapOf("status" to "started", "task" to "dag-sync"))
     }
 
@@ -116,8 +120,14 @@ fun Route.actionApiRoutes(config: ChoamConfig, scheduler: DaemonScheduler?) {
             )
             return@post
         }
+        if (!scheduler.triggerTask("peer_reachability")) {
+            call.respond(
+                HttpStatusCode.Conflict,
+                mapOf("status" to "unavailable", "message" to "Peer reachability task unavailable.")
+            )
+            return@post
+        }
         DaemonState.logActivity("api_trigger", "Peer reachability check triggered via API")
-        scheduler.triggerTask("peer_reachability")
         call.respond(mapOf("status" to "started", "task" to "peer-check"))
     }
 
@@ -129,8 +139,14 @@ fun Route.actionApiRoutes(config: ChoamConfig, scheduler: DaemonScheduler?) {
             )
             return@post
         }
+        if (!scheduler.triggerTask("drive_health")) {
+            call.respond(
+                HttpStatusCode.Conflict,
+                mapOf("status" to "unavailable", "message" to "Drive health task unavailable.")
+            )
+            return@post
+        }
         DaemonState.logActivity("api_trigger", "Drive health check triggered via API")
-        scheduler.triggerTask("drive_health")
         call.respond(mapOf("status" to "started", "task" to "drive-check"))
     }
 

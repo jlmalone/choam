@@ -284,8 +284,8 @@ class SendCommand : CliktCommand(
                 }
             }
             is PreflightOutcome.FallThrough -> {
-                echo("\n  \u001b[31mPre-flight check could not reach destination (SSH unreachable). Transfer aborted.\u001b[0m")
-                echo("  Resolve connectivity and retry, or use 'choam send --queue' to defer processing.")
+                echo("\n  \u001b[31mPre-flight could not classify the destination: machine profile has no sshUser.\u001b[0m")
+                echo("  Set sshUser on the destination machine profile, or use 'choam send --queue' to defer processing.")
                 exitProcess(1)
             }
             is PreflightOutcome.UnsafeAbort -> {

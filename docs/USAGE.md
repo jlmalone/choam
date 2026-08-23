@@ -1,6 +1,6 @@
 # CHOAM Usage
 
-See `CLAUDE.md` in the project root for the full CLI reference (40 commands with examples).
+See `choam <command> --help` for per-command usage. Repository orientation is in `AGENTS.md`; this file is the usage quick reference.
 
 ## Quick Reference
 

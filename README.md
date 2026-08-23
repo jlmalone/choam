@@ -11,7 +11,7 @@ Cross-machine file synchronization for large media repositories.
 
 ## What It Does
 
-CHOAM syncs directories between machines over LAN, Tailscale, or SSH. It handles conflict resolution, bandwidth throttling, SHA-256 verification, and database-aware transfers.
+CHOAM syncs directories between machines over LAN, Tailscale, or SSH. It handles conflict resolution, bandwidth throttling, and database-aware transfers. SHA-256 verification applies to verified MOVE and selected copy paths; see `docs/TRANSFER_RECEIPTS_V1.md` for completion semantics.
 
 Built for the scenario where you have terabytes of media spread across a desktop, laptop, and server, and you need to keep them in sync without cloud services.
 

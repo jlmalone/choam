@@ -102,11 +102,9 @@ fun HTML.dashboardPage(config: ChoamConfig) = layout("Dashboard", "dashboard") {
                 }
             }
             div("detail") {
-                button {
-                    attributes["hx-post"] = "/api/fulfill"
-                    attributes["hx-swap"] = "none"
-                    style = "font-size: 12px; padding: 4px 10px; margin: 2px 0"
-                    +"Fulfill Requests"
+                span {
+                    style = "font-size: 12px; color: #888"
+                    +"Fulfill: run choam fulfill from the CLI (not available via web API)"
                 }
             }
         }
