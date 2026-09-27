@@ -22,6 +22,8 @@ data class QueueStatusItem(
     val filesTotal: Int,
     val rateBytesPerSec: Long,
     val currentFile: String,
+    val error: String? = null,
+    val retryCount: Int? = null,
 )
 
 @Serializable
@@ -55,6 +57,8 @@ fun buildQueueStatusSnapshot(
             filesTotal = progress?.filesTotal ?: 0,
             rateBytesPerSec = progress?.rateBytesPerSec ?: 0,
             currentFile = progress?.currentFile ?: "",
+            error = if (entry.status == TransferStatus.FAILED) entry.error else null,
+            retryCount = if (entry.status == TransferStatus.FAILED) entry.retryCount else null,
         )
     }
     return QueueStatusSnapshot(

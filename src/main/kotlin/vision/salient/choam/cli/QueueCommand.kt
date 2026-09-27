@@ -27,6 +27,7 @@ class QueueCommand : CliktCommand(
           choam queue --run             Process all pending transfers
           choam queue --cancel abc123   Cancel a transfer (pending, failed, OR running)
           choam queue --reset abc123    Reset a stuck/running transfer back to pending
+          choam queue --retry-failed abc123  Requeue exactly one failed transfer
           choam queue --clear           Remove completed/cancelled entries
           choam queue --status          Show full queue with all statuses
           choam queue --status --json   Machine-readable JSON (raw bytes, for tooling)
@@ -35,6 +36,7 @@ class QueueCommand : CliktCommand(
     private val run by option("--run", help = "Process all pending and failed transfers now").flag()
     private val cancel by option("--cancel", help = "Cancel a queued transfer by ID (pending, failed, or running)")
     private val reset by option("--reset", help = "Reset a stuck/running transfer back to pending so the next --run reclaims it")
+    private val retryFailed by option("--retry-failed", help = "Requeue one failed transfer without disturbing the running processor")
     private val clear by option("--clear", help = "Remove completed/cancelled entries from queue").flag()
     private val status by option("--status", help = "Show all queue entries including completed").flag()
     private val asJson by option("--json", help = "Emit queue state as JSON (raw bytes; for tooling)").flag()
@@ -47,6 +49,7 @@ class QueueCommand : CliktCommand(
         when {
             cancel != null -> runCancel(transferQueue, cancel!!)
             reset != null -> runReset(transferQueue, reset!!)
+            retryFailed != null -> runRetryFailed(transferQueue, retryFailed!!)
             clear -> runClear(transferQueue)
             run -> runQueue(transferQueue)
             asJson -> echo(renderQueueReportJson(transferQueue.loadAll()))
@@ -176,6 +179,15 @@ class QueueCommand : CliktCommand(
             echo("Reset transfer $id → pending (will reprocess on the next 'queue --run')")
         } else {
             echo("Transfer $id not found")
+        }
+    }
+
+    private fun runRetryFailed(queue: TransferQueueStore, id: String) {
+        if (queue.retryFailed(id)) {
+            echo("Requeued failed transfer $id. Its source, destination, mode, and overwrite policy are unchanged.")
+        } else {
+            echo("Transfer $id was not found in failed state.")
+            exitProcess(1)
         }
     }
 

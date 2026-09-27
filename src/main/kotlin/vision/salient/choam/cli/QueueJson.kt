@@ -40,6 +40,8 @@ data class QueueJsonItem(
     val filesTotal: Int,
     val rateBytesPerSec: Long,
     val currentFile: String,
+    val error: String? = null,
+    val retryCount: Int? = null,
 )
 
 @Serializable
@@ -72,6 +74,8 @@ fun buildQueueReport(
             filesTotal = lp?.filesTotal ?: 0,
             rateBytesPerSec = lp?.rateBytesPerSec ?: 0L,
             currentFile = lp?.currentFile ?: "",
+            error = if (e.status == TransferStatus.FAILED) e.error else null,
+            retryCount = if (e.status == TransferStatus.FAILED) e.retryCount else null,
         )
     }
     return QueueJsonReport(

@@ -686,6 +686,32 @@ class TransferQueueStore(
         return updated
     }
 
+    /** Requeue exactly one failed entry without touching a live processor or changing its request. */
+    fun retryFailed(id: String): Boolean {
+        val changed = getConnection().use { conn ->
+            conn.prepareStatement("""
+                UPDATE transfer_queue
+                SET status = 'PENDING',
+                    started_at = NULL,
+                    completed_at = NULL,
+                    pid = NULL,
+                    error = NULL,
+                    retry_count = 0,
+                    next_retry_at = NULL,
+                    bytes_transferred = 0
+                WHERE id = ? AND status = 'FAILED'
+            """.trimIndent()).use { ps ->
+                ps.setString(1, id)
+                ps.executeUpdate() == 1
+            }
+        }
+        if (changed) {
+            try { File(choamDir, "queue-progress-$id.json").delete() } catch (_: Exception) {}
+            publishStatusSnapshot()
+        }
+        return changed
+    }
+
     fun clear(completedOnly: Boolean = true) {
         getConnection().use { conn ->
             if (completedOnly) {

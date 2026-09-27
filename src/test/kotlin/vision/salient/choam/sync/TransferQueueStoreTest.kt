@@ -72,6 +72,35 @@ class TransferQueueStoreTest {
     }
 
     @Test
+    fun `retryFailed requeues only the selected failed request`() {
+        store.add(entry(id = "failed01", mode = TransferMode.MOVE))
+        store.add(entry(id = "running1", source = "/tmp/other.mov"))
+        store.update("failed01") { it.copy(
+            status = TransferStatus.FAILED,
+            error = "destination conflict",
+            retryCount = TransferQueueEntry.MAX_RETRIES + 1,
+            nextRetryAt = null,
+            bytesTransferred = 42
+        ) }
+        store.update("running1") { it.copy(status = TransferStatus.RUNNING) }
+
+        assertTrue(!store.retryFailed("running1"))
+        assertTrue(store.retryFailed("failed01"))
+        assertTrue(!store.retryFailed("failed01"))
+
+        val retried = store.loadAll().first { it.id == "failed01" }
+        assertEquals(TransferStatus.PENDING, retried.status)
+        assertEquals(TransferMode.MOVE, retried.mode)
+        assertEquals("/tmp/test.mov", retried.sourcePath)
+        assertEquals("server-b", retried.destinationMachine)
+        assertEquals("/Volumes/EXTERNAL/", retried.destinationPath)
+        assertEquals(0, retried.retryCount)
+        assertEquals(0L, retried.bytesTransferred)
+        assertNull(retried.error)
+        assertEquals(TransferStatus.RUNNING, store.loadAll().first { it.id == "running1" }.status)
+    }
+
+    @Test
     fun `cancel changes status to CANCELLED`() {
         store.add(entry())
         assertTrue(store.cancel("test1234"))
