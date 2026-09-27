@@ -5,6 +5,7 @@ import vision.salient.choam.cli.TargetResolver
 import vision.salient.choam.config.ChoamConfig
 import vision.salient.choam.config.MachineProfile
 import vision.salient.choam.lowPriority
+import vision.salient.choam.niceRemote
 import vision.salient.choam.network.*
 import vision.salient.choam.receipt.QueueReceiptStore
 import vision.salient.choam.receipt.TransferReceiptState
@@ -16,6 +17,7 @@ import java.nio.file.Paths
 import java.nio.file.attribute.BasicFileAttributes
 import java.time.Duration
 import java.time.Instant
+import java.util.concurrent.TimeUnit
 
 private val logger = KotlinLogging.logger {}
 
@@ -60,6 +62,44 @@ class QueueProcessor(
     private val historyStore = SyncHistoryStore()
     private val networkDetector = NetworkDetector()
     private val receiptStore = QueueReceiptStore(queue.receiptDatabasePath)
+    private data class Reachability(val reachable: Boolean, val checkedAt: Long)
+    private val sshReachability = mutableMapOf<String, Reachability>()
+
+    /** ICMP may be blocked even when the queue's actual SSH transport works. */
+    private fun sshTransportReachable(machine: MachineProfile, route: NetworkRoute): Boolean {
+        val target = machine.sshUser?.let { "$it@${route.targetAddress}" } ?: route.targetAddress
+        val key = "$target:${machine.sshPort}"
+        val now = System.currentTimeMillis()
+        sshReachability[key]?.let { cached ->
+            if (now - cached.checkedAt < 30_000) return cached.reachable
+        }
+        val command = buildList {
+            add("ssh")
+            add("-o"); add("BatchMode=yes")
+            add("-o"); add("ConnectionAttempts=1")
+            add("-o"); add("ConnectTimeout=5")
+            if (machine.sshPort != 22) { add("-p"); add(machine.sshPort.toString()) }
+            add(target)
+            add(niceRemote("true"))
+        }
+        val reachable = try {
+            val process = ProcessBuilder(lowPriority(command))
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start()
+            if (!process.waitFor(10, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                false
+            } else {
+                process.exitValue() == 0
+            }
+        } catch (e: Exception) {
+            logger.debug(e) { "SSH reachability probe failed for ${route.targetAddress}" }
+            false
+        }
+        sshReachability[key] = Reachability(reachable, System.currentTimeMillis())
+        return reachable
+    }
 
     /**
      * Only a regular file has a local expectation trusted by this tranche. New directory
@@ -236,10 +276,13 @@ class QueueProcessor(
 
         val route = networkDetector.detectBestRoute(localMachine, remoteMachine)
         val connectivity = networkDetector.testConnectivity(route)
-        if (!connectivity.reachable) {
+        if (!connectivity.reachable && !sshTransportReachable(remoteMachine, route)) {
             echo("  ${entry.id}: ${remoteMachine.name} unreachable — will retry later")
             queue.defer(entry.id, "${remoteMachine.name} unreachable")
             return SingleResult.DEFERRED
+        }
+        if (!connectivity.reachable) {
+            echo("  ${entry.id}: ICMP unavailable; SSH transport confirmed")
         }
 
         // ── SOURCE GUARD: acquire lock, lsof check, fingerprint ──
