@@ -64,6 +64,12 @@ Server Monitor is a read-only consumer of the atomically written
 - `~/Library/Logs/choam-autodrain/drain.log` : each supervised `choam queue --run`
 - `~/.local/state/choam-autodrain/status.json` : last verdict (armed/state/detail)
 
+An idle scheduler can still have failed entries requiring review or entries waiting for
+their retry delay. Its detail distinguishes those states from an empty queue. Connectivity
+deferrals keep the failure retry count unchanged and use a 60–72 second delay; the next
+eligible scheduler evaluation resumes them. Destination conflicts and failed verification
+are not cleared merely because connectivity returns.
+
 Run it once by hand to see what it decides:
 
 ```sh

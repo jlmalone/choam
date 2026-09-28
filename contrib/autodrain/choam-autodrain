@@ -153,17 +153,28 @@ counts="$("$SQLITE" -noheader -separator '|' -cmd '.timeout 5000' "$QUEUE_DB" \
         AND retry_count <= $MAX_RETRIES
         AND (next_retry_at IS NULL OR julianday(next_retry_at) <= julianday('now'))
        THEN 1 ELSE 0 END), 0),
-     COALESCE(SUM(CASE WHEN status='RUNNING' THEN 1 ELSE 0 END), 0)
+     COALESCE(SUM(CASE WHEN status='RUNNING' THEN 1 ELSE 0 END), 0),
+     COALESCE(SUM(CASE WHEN status='FAILED' AND retry_count > $MAX_RETRIES THEN 1 ELSE 0 END), 0),
+     COALESCE(SUM(CASE WHEN status IN ('PENDING','FAILED') AND retry_count <= $MAX_RETRIES THEN 1 ELSE 0 END), 0)
    FROM transfer_queue;" 2>>"$LOG")"
-IFS='|' read -r candidates running <<< "$counts"
+IFS='|' read -r candidates running attention waiting <<< "$counts"
 # A non-numeric result means the READ FAILED. Never treat that as "empty" (that
 # was the silent-blindness bug); surface it and bail so the next tick retries.
-if ! [[ "$candidates" =~ ^[0-9]+$ && "$running" =~ ^[0-9]+$ ]]; then
+if ! [[ "$candidates" =~ ^[0-9]+$ && "$running" =~ ^[0-9]+$ && "$attention" =~ ^[0-9]+$ && "$waiting" =~ ^[0-9]+$ ]]; then
   write_status blocked "queue db read error (cand='$candidates' run='$running')"
   log "blocked: queue db read error cand='$candidates' run='$running'"; exit 0
 fi
 (( running > 0 ))     && { write_status draining "$running running"; exit 0; }
-(( candidates == 0 )) && { write_status idle "queue empty"; exit 0; }
+if (( candidates == 0 )); then
+  if (( attention > 0 )); then
+    write_status idle "no eligible transfers; $attention failed require review; $waiting waiting for retry"
+  elif (( waiting > 0 )); then
+    write_status idle "$waiting transfers waiting for retry"
+  else
+    write_status idle "queue empty"
+  fi
+  exit 0
+fi
 
 # --- 6) Gates pass: heal ssh key, then drain under our supervisor ---------------
 load_ssh_key() {

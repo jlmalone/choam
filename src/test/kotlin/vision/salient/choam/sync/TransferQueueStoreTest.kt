@@ -262,23 +262,27 @@ class TransferQueueStoreTest {
         assertEquals(TransferStatus.PENDING, deferred.status)
         assertNull(deferred.startedAt)
         assertEquals("Deferred: server-b unreachable", deferred.error)
-        assertEquals(1, deferred.retryCount)
+        assertEquals(0, deferred.retryCount)
         assertNotNull(deferred.nextRetryAt)
         assertTrue(Instant.parse(deferred.nextRetryAt).isAfter(Instant.now()))
         assertNull(store.claimNext(), "deferred entry must not be reclaimed before its backoff expires")
     }
 
     @Test
-    fun `repeated deferral caps retry count without exhausting transient work`() {
+    fun `repeated connectivity deferral preserves the real failure budget`() {
         store.add(entry())
-        store.update("test1234") { it.copy(retryCount = TransferQueueEntry.MAX_RETRIES) }
-        assertNotNull(store.claimNext())
-
-        assertTrue(store.defer("test1234", "server-b unreachable"))
+        store.update("test1234") { it.copy(retryCount = 2) }
+        repeat(TransferQueueEntry.MAX_RETRIES + 2) {
+            store.update("test1234") { it.copy(nextRetryAt = null) }
+            assertNotNull(store.claimNext())
+            assertTrue(store.defer("test1234", "server-b unreachable"))
+            assertEquals(2, store.loadAll().single().retryCount)
+            assertNull(store.claimNext(), "connectivity deferral must still enforce backoff")
+        }
 
         val deferred = store.loadAll().single()
         assertEquals(TransferStatus.PENDING, deferred.status)
-        assertEquals(TransferQueueEntry.MAX_RETRIES, deferred.retryCount)
+        assertEquals(2, deferred.retryCount)
         assertNotNull(deferred.nextRetryAt)
     }
 

@@ -528,7 +528,7 @@ class TransferQueueStore(
     }
 
     /**
-     * Return a claimed entry to PENDING with bounded exponential backoff.
+     * Return a claimed entry to PENDING without consuming its failure retry budget.
      *
      * A deferred entry must not remain immediately claimable. Otherwise the same
      * unreachable destination is reclaimed in a tight loop and starves every
@@ -538,8 +538,10 @@ class TransferQueueStore(
         val deferred = getConnection().use { conn ->
             val entry = loadById(conn, id) ?: return@use false
             if (entry.status != TransferStatus.RUNNING) return@use false
-            val retryCount = (entry.retryCount + 1).coerceAtMost(TransferQueueEntry.MAX_RETRIES)
-            val nextRetryAt = TransferQueueEntry.nextBackoff(retryCount).toString()
+            // Connectivity is not a failed transfer attempt. Preserve any real failure
+            // count, and use a short delay so the next scheduler pass can resume safely.
+            val retryCount = entry.retryCount
+            val nextRetryAt = TransferQueueEntry.nextBackoff(1).toString()
             conn.prepareStatement("""
                 UPDATE transfer_queue
                 SET status = 'PENDING',
